@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DDB Offline Sourcebook Builder
 // @namespace    https://tampermonkey.net/
-// @version      0.8.0
+// @version      0.9.0
 // @description  Build a print-ready offline PDF from D&D Beyond sourcebooks your logged-in account can access.
 // @author       Brandon / OpenAI
 // @match        https://www.dndbeyond.com/sources/*
@@ -94,16 +94,33 @@
 
     function determineBookRoots(root) {
         if (!root) return [];
+
         const parts = root.split('/').filter(Boolean);
         const roots = new Set([root.replace(/\/+$/, '')]);
+
+        // D&D Beyond currently mixes two valid source URL layouts:
+        //   /sources/dnd/<slug>       (newer landing pages)
+        //   /sources/<slug>/<chapter> (many legacy/adventure chapter pages)
+        //
+        // Treat both forms as aliases for the same book. This is intentionally
+        // structure-driven rather than hard-coding individual titles.
         let slug = null;
-        if (parts[0] === 'sources' && parts[1] === 'dnd' && parts[2]) slug = parts[2];
-        else if (parts[0] === 'sources' && parts[1]) slug = parts[1];
+        if (parts[0] === 'sources' && parts[1] === 'dnd' && parts[2]) {
+            slug = parts[2];
+        } else if (parts[0] === 'sources' && parts[1]) {
+            slug = parts[1];
+        }
+
         if (slug) {
             roots.add(`/sources/${slug}`);
             roots.add(`/sources/dnd/${slug}`);
         }
+
         return [...roots];
+    }
+
+    function isLandingPage(root) {
+        return location.pathname.replace(/\/+$/, '') === root.replace(/\/+$/, '');
     }
 
     function pathBelongsToBook(pathname, bookRoots) {
@@ -114,10 +131,6 @@
     function isBookRootPath(pathname, bookRoots) {
         const path = pathname.replace(/\/+$/, '');
         return bookRoots.some(root => path === root);
-    }
-
-    function isLandingPage(root) {
-        return location.pathname.replace(/\/+$/, '') === root.replace(/\/+$/, '');
     }
 
     function isSameBook(url, bookRoots) {
@@ -212,7 +225,25 @@
             if (entries.length) groups.push({ title: h.textContent.trim(), entries });
             if (seen.size >= CONFIG.maxIndexedLinks) break;
         }
-        return groups;
+        // Landing pages can expose the same semantic reference collection
+        // through more than one nested heading (for example, a parent label and
+        // a child label with identical text). Merge same-named groups in the
+        // generated reference index while preserving entry order.
+        const merged = [];
+        const byTitle = new Map();
+
+        for (const group of groups) {
+            const key = group.title.replace(/\s+/g, ' ').trim().toLowerCase();
+            if (!byTitle.has(key)) {
+                const copy = { title: group.title, entries: [...group.entries] };
+                byTitle.set(key, copy);
+                merged.push(copy);
+            } else {
+                byTitle.get(key).entries.push(...group.entries);
+            }
+        }
+
+        return merged;
     }
 
     const flattenEntries = groups => groups.flatMap(g => g.entries);
@@ -310,6 +341,29 @@
             img.decoding = 'sync';
         });
 
+        root.querySelectorAll('source').forEach(source => {
+            const src = source.getAttribute('src');
+            if (src) source.setAttribute('src', absoluteUrl(src, sourceUrl));
+
+            const srcset = source.getAttribute('srcset');
+            if (srcset && !srcset.startsWith('data:')) {
+                source.setAttribute('srcset', srcset.split(',').map(x => {
+                    const parts = x.trim().split(/\s+/);
+                    parts[0] = absoluteUrl(parts[0], sourceUrl);
+                    return parts.join(' ');
+                }).join(', '));
+            }
+        });
+
+        root.querySelectorAll('[style]').forEach(el => {
+            const style = el.getAttribute('style');
+            if (!style || !style.includes('url(')) return;
+            el.setAttribute('style', style.replace(/url\((['"]?)(.*?)\1\)/gi, (match, quote, assetUrl) => {
+                if (/^(data:|blob:)/i.test(assetUrl)) return match;
+                return `url("${absoluteUrl(assetUrl, sourceUrl)}")`;
+            }));
+        });
+
         root.querySelectorAll('a[href]').forEach(a => {
             const href = a.getAttribute('href');
             if (href && !href.startsWith('#')) a.setAttribute('href', absoluteUrl(href, sourceUrl));
@@ -326,24 +380,155 @@
 
     function looksLikeArtistCredit(el) {
         if (!el || !['P', 'DIV', 'SPAN', 'FIGCAPTION'].includes(el.tagName)) return false;
+
         const t = el.textContent?.replace(/\s+/g, ' ').trim() || '';
-        if (!t || t.length > 80 || t.split(/\s+/).length > 7 || /[.!?;:]/.test(t)) return false;
-        if (/\b(AC|HP|CR|Speed|Action|Trait|Habitat|Treasure|Language|Immunity|Resistance)\b/i.test(t)) return false;
-        return /[A-Za-z]/.test(t);
+        if (!t || t.length > 70 || /[.!?;:]/.test(t) || /\d/.test(t)) return false;
+
+        const words = t.split(/\s+/).filter(Boolean);
+        if (words.length < 1 || words.length > 5) return false;
+
+        if (/\b(AC|HP|CR|Speed|Action|Trait|Habitat|Treasure|Language|Immunity|Resistance|Chapter|Appendix|Map|Table|Contents|Creatures?|Monsters?|Spells?|Items?)\b/i.test(t)) {
+            return false;
+        }
+
+        // Artist credits are typically a personal/studio name rather than a
+        // sentence or heading. Keep the test conservative so ordinary short
+        // adventure text is not accidentally glued to unrelated artwork.
+        const nameLike = words.every(word =>
+            /^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*$/.test(word) ||
+            /^[A-Z0-9][A-Za-z0-9'’.-]*$/.test(word)
+        );
+
+        return nameLike;
     }
 
     function groupArtwork(root) {
         const done = new Set();
+
         for (const img of [...root.querySelectorAll('img')]) {
-            let art = img.closest('figure') || img.closest('picture') || img;
+            const art = img.closest('figure') || img.closest('picture') || img;
             if (done.has(art) || art.closest('.ddb-art-block')) continue;
             done.add(art);
+
             const prev = art.previousElementSibling;
             if (!looksLikeArtistCredit(prev)) continue;
+
             const wrap = root.ownerDocument.createElement('div');
             wrap.className = 'ddb-art-block';
+            prev.classList.add('ddb-art-credit');
+            art.classList.add('ddb-artwork');
+
             art.parentNode.insertBefore(wrap, prev);
             wrap.append(prev, art);
+        }
+    }
+
+    function markSemanticCallouts(root) {
+        const readAloudSelectors = [
+            '[class*="read-aloud" i]',
+            '[class*="readaloud" i]',
+            '[class*="read_aloud" i]',
+            '[class*="boxed-text" i]',
+            '[class*="boxedtext" i]',
+            '[class*="quote-box" i]'
+        ];
+
+        const calloutSelectors = [
+            'blockquote',
+            '[class*="callout" i]',
+            '[class*="sidebar" i]',
+            '[class*="note-box" i]',
+            '[class*="rules-box" i]',
+            '[class*="rules-text" i]',
+            '[class*="compendium-note" i]'
+        ];
+
+        const addMatches = (selectors, className) => {
+            for (const selector of selectors) {
+                let matches = [];
+                try { matches = [...root.querySelectorAll(selector)]; }
+                catch { continue; }
+
+                for (const el of matches) {
+                    if (el.closest('.ddb-stat-block')) continue;
+                    const content = (el.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (!content || content.length < 20) continue;
+                    el.classList.add(className);
+                }
+            }
+        };
+
+        addMatches(calloutSelectors, 'ddb-callout');
+        addMatches(readAloudSelectors, 'ddb-read-aloud');
+    }
+
+    function markStructuredLayouts(root) {
+        // Preserve source components that advertise themselves as card/grid/
+        // flow layouts. This is feature-driven, not tied to any book title.
+        for (const el of [...root.querySelectorAll('[class]')]) {
+            if (el.closest('.ddb-stat-block,table')) continue;
+
+            const classes = String(el.className || '');
+            const childCount = el.children?.length || 0;
+            if (childCount < 2 || childCount > 24) continue;
+
+            const headingCount = el.querySelectorAll('h1,h2,h3,h4,h5,h6').length;
+            if (headingCount < 2) continue;
+
+            if (/\b(flowchart|flow-chart|flow_chart|card-grid|cardgrid|cards-grid|tile-grid|reference-grid)\b/i.test(classes)) {
+                el.classList.add('ddb-structured-grid', 'ddb-flow-grid');
+            } else if (/\b(grid|cards|columns)\b/i.test(classes) && childCount <= 12) {
+                el.classList.add('ddb-structured-grid');
+            }
+        }
+
+        // Some D&D Beyond flowcharts are represented as ordinary heading/text
+        // siblings rather than a dedicated grid component. Reconstruct only
+        // when the document explicitly labels a section as a flowchart and it
+        // contains multiple lower-level heading groups.
+        const flowHeadings = [...root.querySelectorAll('h1,h2,h3,h4,h5,h6')]
+            .filter(h => /\bflow\s*chart\b/i.test((h.textContent || '').trim()));
+
+        for (const flowHeading of flowHeadings) {
+            const flowLevel = headingLevel(flowHeading);
+            const nodes = [];
+            let cursor = flowHeading.nextElementSibling;
+
+            while (cursor) {
+                if (/^H[1-6]$/.test(cursor.tagName) && headingLevel(cursor) <= flowLevel) break;
+                nodes.push(cursor);
+                cursor = cursor.nextElementSibling;
+            }
+
+            const lowerHeadings = nodes.filter(el =>
+                /^H[1-6]$/.test(el.tagName) && headingLevel(el) > flowLevel
+            );
+            if (lowerHeadings.length < 2) continue;
+
+            const cardLevel = Math.min(...lowerHeadings.map(headingLevel));
+            const starts = nodes.filter(el =>
+                /^H[1-6]$/.test(el.tagName) && headingLevel(el) === cardLevel
+            );
+            if (starts.length < 2) continue;
+
+            const grid = root.ownerDocument.createElement('div');
+            grid.className = 'ddb-structured-grid ddb-flow-grid ddb-rebuilt-flowchart';
+            flowHeading.insertAdjacentElement('afterend', grid);
+
+            let card = null;
+            for (const node of nodes) {
+                if (/^H[1-6]$/.test(node.tagName) && headingLevel(node) === cardLevel) {
+                    card = root.ownerDocument.createElement('section');
+                    card.className = 'ddb-flow-card';
+                    grid.appendChild(card);
+                }
+
+                if (card) {
+                    card.appendChild(node);
+                } else {
+                    grid.insertAdjacentElement('beforebegin', node);
+                }
+            }
         }
     }
 
@@ -371,7 +556,6 @@
         });
         return map;
     }
-
 
     function normalizeMinus(value = '') {
         return String(value).replace(/[−–—]/g, '-');
@@ -513,7 +697,6 @@
         }
     }
 
-
     function findFragmentTargetInNode(root, fragment) {
         if (!fragment) return null;
 
@@ -592,6 +775,8 @@
         const node = cleanupContent(article, sourceUrl);
         groupArtwork(node);
         enhanceStatBlocks(node);
+        markSemanticCallouts(node);
+        markStructuredLayouts(node);
         markIndexedEntryBoundaries(node, indexedEntries);
         const anchorMap = namespaceAnchors(node, namespace);
         return {
@@ -667,7 +852,7 @@ body{margin:0 auto;max-width:8in;padding:.28in;color:#111!important;font-size:10
 .ddb-cover{text-align:center;break-after:page!important;page-break-after:always!important}.ddb-cover h1{font-size:30pt;line-height:1.08;margin:0 0 16pt;break-after:avoid-page!important}
 .ddb-cover img{display:block!important;width:auto!important;max-width:100%!important;max-height:7in!important;height:auto!important;object-fit:contain!important;margin:0 auto!important}
 .ddb-source{margin:12pt auto 0;max-width:90%;font:8pt/1.3 Arial,sans-serif;opacity:.62;overflow-wrap:anywhere}
-.ddb-generated-toc{break-after:page!important;page-break-after:always!important}.ddb-generated-toc ol,.ddb-generated-index ul{padding-left:1.35rem}.ddb-generated-toc li,.ddb-generated-index li{margin:.14rem 0}.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}.ddb-generated-index.ddb-large-index ul{column-count:2;column-gap:1.4rem;column-fill:auto}.ddb-generated-index.ddb-large-index li{break-inside:avoid-column!important;page-break-inside:avoid!important}
+.ddb-generated-toc{break-after:page!important;page-break-after:always!important}.ddb-generated-toc>ol{padding-left:1.35rem}.ddb-generated-toc>ol>li{margin:.14rem 0}.ddb-generated-toc a,.ddb-reference-index a{color:inherit!important;text-decoration:none!important}.ddb-reference-index{margin-top:1.2em;padding-top:.7em;border-top:1.5px solid #8b1e1e}.ddb-reference-index>h1{font-size:18pt!important;margin:.2em 0 .55em!important}.ddb-generated-index{break-inside:auto!important;page-break-inside:auto!important;margin:0 0 .9em}.ddb-generated-index h2{font-size:12.5pt!important;margin:.55em 0 .28em!important;break-after:avoid-column!important}.ddb-generated-index ul{padding-left:1.15rem;margin:.15em 0 .7em}.ddb-generated-index li{margin:.08rem 0;break-inside:avoid-column!important;page-break-inside:avoid!important}.ddb-index-cols-2 .ddb-generated-index ul{column-count:2;column-gap:1.3rem}.ddb-index-cols-3 .ddb-generated-index ul{column-count:3;column-gap:1.05rem;font-size:8.9pt;line-height:1.22}
 .ddb-content-root,.ddb-major-page,.ddb-reference-document{width:100%;clear:both}
 .ddb-content-root *,.ddb-content-root *::before,.ddb-content-root *::after{break-before:auto!important;break-after:auto!important;page-break-before:auto!important;page-break-after:auto!important;break-inside:auto!important;page-break-inside:auto!important}
 .ddb-major-page{${CONFIG.majorPagesStartNewPage ? 'break-before:page!important;page-break-before:always!important;' : ''}}
@@ -685,9 +870,8 @@ table{width:100%;max-width:100%;border-collapse:collapse;break-inside:auto!impor
 .ddb-short-table{break-inside:avoid-page!important;page-break-inside:avoid!important}
 .ddb-short-table-heading{break-after:avoid-page!important;page-break-after:avoid!important;margin-bottom:.28em!important}
 figure,picture{max-width:100%!important;break-inside:auto!important;page-break-inside:auto!important;margin-left:auto;margin-right:auto}img,picture,svg,canvas{max-width:100%!important;height:auto!important}.ddb-content-root img{max-height:6.9in!important;object-fit:contain!important}
-.ddb-art-block{clear:both;break-inside:auto!important;page-break-inside:auto!important;margin:.35em 0 .7em}.ddb-art-block>:first-child{break-after:avoid-page!important;page-break-after:avoid!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:6.75in!important;margin:.15em auto 0!important}figcaption{text-align:center;break-before:avoid-page!important}
-
-.ddb-print-table{width:100%!important;border-collapse:collapse!important;border-spacing:0!important;margin:.45em 0 .8em!important;font-size:9.4pt!important;line-height:1.25!important;background:#fff!important}
+.ddb-art-block{clear:both;break-inside:avoid-page!important;page-break-inside:avoid!important;margin:.35em 0 .75em}.ddb-art-credit{break-after:avoid-page!important;page-break-after:avoid!important;margin-bottom:.1em!important}.ddb-art-block img,.ddb-art-block .ddb-artwork{display:block!important;width:auto!important;max-width:100%!important;max-height:5.25in!important;object-fit:contain!important;margin:.12em auto 0!important}.ddb-art-block+.ddb-content-entry-start{margin-top:1.15em!important}figcaption{text-align:center;break-before:avoid-page!important}
+.ddb-callout,.ddb-read-aloud{margin:.7em .7em .85em!important;padding:.62em .78em!important;border-left:3px solid #8b1e1e!important;background:#f5f1e8!important;break-inside:avoid-page!important;page-break-inside:avoid!important}.ddb-read-aloud{font-style:italic!important;background:#f1eee6!important}.ddb-callout>:first-child,.ddb-read-aloud>:first-child{margin-top:0!important}.ddb-callout>:last-child,.ddb-read-aloud>:last-child{margin-bottom:0!important}.ddb-structured-grid{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:.55em .7em!important;align-items:start!important;margin:.55em 0 .9em!important}.ddb-structured-grid>*{min-width:0!important;break-inside:avoid-page!important;page-break-inside:avoid!important}.ddb-flow-grid>*{padding:.45em .5em!important;border:1px solid #c7bba7!important;background:#faf8f2!important}.ddb-flow-card>h1:first-child,.ddb-flow-card>h2:first-child,.ddb-flow-card>h3:first-child,.ddb-flow-card>h4:first-child,.ddb-flow-card>h5:first-child,.ddb-flow-card>h6:first-child{margin-top:0!important}.ddb-flow-card>:last-child{margin-bottom:0!important}@media print and (max-width:6.5in){.ddb-structured-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}.ddb-print-table{width:100%!important;border-collapse:collapse!important;border-spacing:0!important;margin:.45em 0 .8em!important;font-size:9.4pt!important;line-height:1.25!important;background:#fff!important}
 .ddb-print-table th,.ddb-print-table td{padding:.22em .42em!important;border:1px solid #777!important;text-align:left!important;vertical-align:top!important}
 .ddb-print-table thead th{font-weight:700!important;background:#ece9df!important;border-bottom:2px solid #555!important}
 .ddb-print-table tbody tr:nth-child(even)>td,.ddb-print-table tbody tr:nth-child(even)>th{background:#f7f5ef!important}
@@ -711,10 +895,15 @@ figure,picture{max-width:100%!important;break-inside:auto!important;page-break-i
     }
 
     function buildIndex(groups, targetMap) {
-        return groups.map(g => {
-            const sizeClass = g.entries.length >= 80 ? ' ddb-large-index' : '';
-            return `<section class="ddb-generated-index${sizeClass}"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href="${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`;
+        const totalEntries = flattenEntries(groups).length;
+        if (!totalEntries) return '';
+
+        const columns = totalEntries > 180 ? 3 : totalEntries > 30 ? 2 : 1;
+        const groupsHtml = groups.map(g => {
+            return `<section class="ddb-generated-index"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href="${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`;
         }).join('');
+
+        return `<div class="ddb-reference-index ddb-index-cols-${columns}"><h1>Reference Index</h1>${groupsHtml}</div>`;
     }
 
     function trailingPrimary(page) { return /^(appendix\b|credits?\b|acknowledg|legal\b|index\b)/i.test(page.label.trim()); }
