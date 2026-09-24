@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DDB Offline Sourcebook Builder
 // @namespace    https://tampermonkey.net/
-// @version      0.7.0
+// @version      0.8.0
 // @description  Build a print-ready offline PDF from D&D Beyond sourcebooks your logged-in account can access.
 // @author       Brandon / OpenAI
 // @match        https://www.dndbeyond.com/sources/*
@@ -87,19 +87,43 @@
     function determineBookRoot() {
         const p = location.pathname.split('/').filter(Boolean);
         if (p[0] !== 'sources') return null;
-        if (p[1] === 'dnd' && p[2]) return '/' + p.slice(0, 3).join('/');
+        if (p[1] === 'dnd') return p[2] ? '/' + p.slice(0, 3).join('/') : null;
         if (p[1]) return '/' + p.slice(0, 2).join('/');
         return null;
+    }
+
+    function determineBookRoots(root) {
+        if (!root) return [];
+        const parts = root.split('/').filter(Boolean);
+        const roots = new Set([root.replace(/\/+$/, '')]);
+        let slug = null;
+        if (parts[0] === 'sources' && parts[1] === 'dnd' && parts[2]) slug = parts[2];
+        else if (parts[0] === 'sources' && parts[1]) slug = parts[1];
+        if (slug) {
+            roots.add(`/sources/${slug}`);
+            roots.add(`/sources/dnd/${slug}`);
+        }
+        return [...roots];
+    }
+
+    function pathBelongsToBook(pathname, bookRoots) {
+        const path = pathname.replace(/\/+$/, '');
+        return bookRoots.some(root => path === root || path.startsWith(root + '/'));
+    }
+
+    function isBookRootPath(pathname, bookRoots) {
+        const path = pathname.replace(/\/+$/, '');
+        return bookRoots.some(root => path === root);
     }
 
     function isLandingPage(root) {
         return location.pathname.replace(/\/+$/, '') === root.replace(/\/+$/, '');
     }
 
-    function isSameBook(url, root) {
+    function isSameBook(url, bookRoots) {
         try {
             const u = new URL(url, location.href);
-            return u.origin === location.origin && (u.pathname === root || u.pathname.startsWith(root + '/'));
+            return u.origin === location.origin && pathBelongsToBook(u.pathname, bookRoots);
         } catch { return false; }
     }
 
@@ -139,18 +163,18 @@
         return h ? elementsAfterHeading(h) : [];
     }
 
-    function discoverPrimaryPages(root) {
+    function discoverPrimaryPages(root, bookRoots) {
         let links = findTocLinks();
-        if (!links.length) links = [...mainEl().querySelectorAll('a[href]')].filter(a => isSameBook(a.href, root));
+        if (!links.length) links = [...mainEl().querySelectorAll('a[href]')].filter(a => isSameBook(a.href, bookRoots));
 
         const seen = new Set();
         const pages = [];
         for (const a of links) {
             let u;
             try { u = new URL(a.href, location.href); } catch { continue; }
-            if (!isSameBook(u.href, root)) continue;
+            if (!isSameBook(u.href, bookRoots)) continue;
             u.hash = '';
-            if (u.pathname.replace(/\/+$/, '') === root.replace(/\/+$/, '')) continue;
+            if (isBookRootPath(u.pathname, bookRoots)) continue;
             if (seen.has(u.href)) continue;
             seen.add(u.href);
             const label = a.textContent.trim() || decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || 'Section');
@@ -159,10 +183,10 @@
         return pages;
     }
 
-    const INDEX_HEADING_RE = /\b(index|stat blocks?|spell descriptions?|creature stat blocks?|monster entries?|magic items?|feats?|background descriptions?|species descriptions?|rules glossary|glossary|reference)\b/i;
+    const INDEX_HEADING_RE = /\b(index|stat blocks?|spell descriptions?|creature stat blocks?|monster entries?|creatures?|npcs?|sidekicks?|magic items?|feats?|background descriptions?|species descriptions?|rules glossary|glossary|reference)\b/i;
     const REFERENCE_PATHS = ['/monsters/', '/spells/', '/magic-items/', '/feats/', '/backgrounds/', '/species/', '/equipment/', '/vehicles/'];
 
-    function discoverIndexGroups(root) {
+    function discoverIndexGroups(root, bookRoots) {
         const groups = [];
         const seen = new Set();
         const headings = [...mainEl().querySelectorAll('h1,h2,h3,h4,h5,h6')]
@@ -175,7 +199,7 @@
                 if (!label) continue;
                 let u;
                 try { u = new URL(a.href, location.href); } catch { continue; }
-                const sameBookFragment = isSameBook(u.href, root) && Boolean(u.hash);
+                const sameBookFragment = isSameBook(u.href, bookRoots) && Boolean(u.hash);
                 const referencePage = u.origin === location.origin && REFERENCE_PATHS.some(p => u.pathname.startsWith(p));
                 if (!sameBookFragment && !referencePage) continue;
 
@@ -549,11 +573,11 @@
             // without making assumptions about what kind of D&D content it is.
             let sibling = marker.nextElementSibling;
             let tagged = 0;
-            while (sibling && tagged < 2) {
+            while (sibling && tagged < 1) {
                 if (/^H[1-6]$/.test(sibling.tagName)) break;
                 if (sibling.matches('table,figure,picture,img,.ddb-art-block,.ddb-stat-block')) break;
                 const compactText = (sibling.textContent || '').replace(/\s+/g, ' ').trim();
-                if (!compactText || compactText.length > 260) break;
+                if (!compactText || compactText.length > 190) break;
                 sibling.classList.add('ddb-entry-opening-part');
                 tagged += 1;
                 sibling = sibling.nextElementSibling;
@@ -643,25 +667,25 @@ body{margin:0 auto;max-width:8in;padding:.28in;color:#111!important;font-size:10
 .ddb-cover{text-align:center;break-after:page!important;page-break-after:always!important}.ddb-cover h1{font-size:30pt;line-height:1.08;margin:0 0 16pt;break-after:avoid-page!important}
 .ddb-cover img{display:block!important;width:auto!important;max-width:100%!important;max-height:7in!important;height:auto!important;object-fit:contain!important;margin:0 auto!important}
 .ddb-source{margin:12pt auto 0;max-width:90%;font:8pt/1.3 Arial,sans-serif;opacity:.62;overflow-wrap:anywhere}
-.ddb-generated-toc{break-after:page!important;page-break-after:always!important}.ddb-generated-toc ol,.ddb-generated-index ul{padding-left:1.35rem}.ddb-generated-toc li,.ddb-generated-index li{margin:.14rem 0}.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}
+.ddb-generated-toc{break-after:page!important;page-break-after:always!important}.ddb-generated-toc ol,.ddb-generated-index ul{padding-left:1.35rem}.ddb-generated-toc li,.ddb-generated-index li{margin:.14rem 0}.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}.ddb-generated-index.ddb-large-index ul{column-count:2;column-gap:1.4rem;column-fill:auto}.ddb-generated-index.ddb-large-index li{break-inside:avoid-column!important;page-break-inside:avoid!important}
 .ddb-content-root,.ddb-major-page,.ddb-reference-document{width:100%;clear:both}
 .ddb-content-root *,.ddb-content-root *::before,.ddb-content-root *::after{break-before:auto!important;break-after:auto!important;page-break-before:auto!important;page-break-after:auto!important;break-inside:auto!important;page-break-inside:auto!important}
 .ddb-major-page{${CONFIG.majorPagesStartNewPage ? 'break-before:page!important;page-break-before:always!important;' : ''}}
-.ddb-reference-document+.ddb-reference-document{margin-top:1.65em!important;padding-top:.75em!important;border-top:1px solid #b8aa96!important}
+.ddb-reference-document+.ddb-reference-document{margin-top:1.45em!important;padding-top:.62em!important;border-top:1px solid #b8aa96!important}
 .ddb-content-root h1{margin-top:1.65em!important;margin-bottom:.5em!important}
 .ddb-content-root h2{margin-top:1.4em!important;margin-bottom:.42em!important}
 .ddb-content-root h3{margin-top:1.15em!important;margin-bottom:.36em!important}
 .ddb-content-root h4,.ddb-content-root h5,.ddb-content-root h6{margin-top:.95em!important;margin-bottom:.3em!important}
 .ddb-content-entry-start{margin-top:1.55em!important;padding-top:.65em!important;border-top:1.35px solid rgba(125,35,30,.62)!important;break-after:avoid-page!important;page-break-after:avoid!important}
 .ddb-content-entry-start:first-child{margin-top:.35em!important}
-.ddb-content-entry-start+.ddb-entry-opening-part,.ddb-content-entry-start+.ddb-entry-opening-part+.ddb-entry-opening-part{break-before:avoid-page!important;page-break-before:avoid!important;break-after:avoid-page!important;page-break-after:avoid!important}
+.ddb-content-entry-start+.ddb-entry-opening-part{break-before:avoid-page!important;page-break-before:avoid!important}
 p{orphans:3;widows:3}h1,h2,h3,h4,h5,h6{break-after:avoid-page!important;page-break-after:avoid!important;orphans:3;widows:3}h1+*,h2+*,h3+*,h4+*,h5+*,h6+*{break-before:avoid-page!important;page-break-before:avoid!important}
 ul,ol,li,blockquote,aside{break-inside:auto!important;page-break-inside:auto!important}
 table{width:100%;max-width:100%;border-collapse:collapse;break-inside:auto!important}thead{display:table-header-group}tfoot{display:table-footer-group}tr{break-inside:avoid-page!important;page-break-inside:avoid!important}th,td{vertical-align:top}
 .ddb-short-table{break-inside:avoid-page!important;page-break-inside:avoid!important}
 .ddb-short-table-heading{break-after:avoid-page!important;page-break-after:avoid!important;margin-bottom:.28em!important}
-figure,picture{max-width:100%!important;break-inside:auto!important;page-break-inside:auto!important;margin-left:auto;margin-right:auto}img,picture,svg,canvas{max-width:100%!important;height:auto!important}.ddb-content-root img{max-height:7.25in!important;object-fit:contain!important}
-.ddb-art-block{clear:both;break-inside:avoid-page!important;page-break-inside:avoid!important;margin:.35em 0 .75em}.ddb-art-block>:first-child{break-after:avoid-page!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:7.05in!important;margin:.15em auto 0!important}figcaption{text-align:center;break-before:avoid-page!important}
+figure,picture{max-width:100%!important;break-inside:auto!important;page-break-inside:auto!important;margin-left:auto;margin-right:auto}img,picture,svg,canvas{max-width:100%!important;height:auto!important}.ddb-content-root img{max-height:6.9in!important;object-fit:contain!important}
+.ddb-art-block{clear:both;break-inside:auto!important;page-break-inside:auto!important;margin:.35em 0 .7em}.ddb-art-block>:first-child{break-after:avoid-page!important;page-break-after:avoid!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:6.75in!important;margin:.15em auto 0!important}figcaption{text-align:center;break-before:avoid-page!important}
 
 .ddb-print-table{width:100%!important;border-collapse:collapse!important;border-spacing:0!important;margin:.45em 0 .8em!important;font-size:9.4pt!important;line-height:1.25!important;background:#fff!important}
 .ddb-print-table th,.ddb-print-table td{padding:.22em .42em!important;border:1px solid #777!important;text-align:left!important;vertical-align:top!important}
@@ -687,7 +711,10 @@ figure,picture{max-width:100%!important;break-inside:auto!important;page-break-i
     }
 
     function buildIndex(groups, targetMap) {
-        return groups.map(g => `<section class="ddb-generated-index"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href="${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`).join('');
+        return groups.map(g => {
+            const sizeClass = g.entries.length >= 80 ? ' ddb-large-index' : '';
+            return `<section class="ddb-generated-index${sizeClass}"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href="${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`;
+        }).join('');
     }
 
     function trailingPrimary(page) { return /^(appendix\b|credits?\b|acknowledg|legal\b|index\b)/i.test(page.label.trim()); }
@@ -747,6 +774,7 @@ figure,picture{max-width:100%!important;break-inside:auto!important;page-break-i
     }
 
     const root = determineBookRoot();
+    const bookRoots = determineBookRoots(root);
     if (!root || !isLandingPage(root)) return;
 
     const panel = document.createElement('div');
@@ -775,12 +803,14 @@ figure,picture{max-width:100%!important;break-inside:auto!important;page-break-i
 
         try {
             const bookTitle = cleanBookTitle();
-            const primaryPages = discoverPrimaryPages(root);
-            const indexGroups = discoverIndexGroups(root);
+            const primaryPages = discoverPrimaryPages(root, bookRoots);
+            const indexGroups = discoverIndexGroups(root, bookRoots);
             const entries = flattenEntries(indexGroups);
             const refs = buildReferenceDocuments(entries, primaryPages);
+            log('Detected source roots', bookRoots);
+            log('Primary source documents', primaryPages.map(p => p.url));
 
-            if (!primaryPages.length) throw new Error('No sourcebook pages found. Open the book main Contents page.');
+            if (!primaryPages.length) throw new Error(`No sourcebook pages found. Detected source roots: ${bookRoots.join(', ')}. Open the book main Contents page and reload.`);
 
             const primaryResults = new Array(primaryPages.length);
             for (let i = 0; i < primaryPages.length; i++) {
