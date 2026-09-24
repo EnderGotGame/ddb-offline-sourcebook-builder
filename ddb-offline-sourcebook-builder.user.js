@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DDB Offline Sourcebook Builder
 // @namespace    https://tampermonkey.net/
-// @version      0.6.0
+// @version      0.7.0
 // @description  Build a print-ready offline PDF from D&D Beyond sourcebooks your logged-in account can access.
 // @author       Brandon / OpenAI
 // @match        https://www.dndbeyond.com/sources/*
@@ -348,6 +348,7 @@
         return map;
     }
 
+
     function normalizeMinus(value = '') {
         return String(value).replace(/[−–—]/g, '-');
     }
@@ -396,6 +397,18 @@
         for (const table of root.querySelectorAll('table')) {
             table.classList.add('ddb-print-table');
             const text = normalizeMinus(table.textContent || '').replace(/\s+/g, ' ').trim();
+            const rowCount = table.rows?.length || table.querySelectorAll('tr').length;
+
+            if (rowCount > 0 && rowCount <= 12) {
+                table.classList.add('ddb-short-table');
+
+                // Keep a nearby table title with a compact table when practical.
+                const previous = table.previousElementSibling;
+                if (previous && /^H[1-6]$/.test(previous.tagName)) {
+                    previous.classList.add('ddb-short-table-heading');
+                }
+            }
+
             if (/\b(Str|Dex|Con|Int|Wis|Cha)\b/i.test(text) && /\b(Mod|Save|Ability Score)\b/i.test(text)) {
                 table.classList.add('ddb-ability-source-table');
             } else if (/\b1d\d+\b/i.test(text) || /^d\d+\b/i.test(text)) {
@@ -415,6 +428,7 @@
             '[class*="stat-block"]'
         ].join(','))];
 
+        // Keep only the outermost matching stat-block containers.
         const blocks = candidates.filter(el => !el.parentElement?.closest([
             '.mon-stat-block',
             '.monster-stat-block',
@@ -426,6 +440,7 @@
         for (const block of blocks) {
             block.classList.add('ddb-stat-block');
 
+            // Merge the two common three-ability source tables into one compact six-ability print table.
             const sourceTables = [...block.querySelectorAll('table')];
             const rows = sourceTables.flatMap(parseAbilityRowsFromTable);
             const unique = [];
@@ -449,6 +464,7 @@
                 }
             }
 
+            // Give the standard D&D Beyond label/value rows a real print grid.
             block.querySelectorAll('.mon-stat-block__attribute,[class*="stat-block__attribute"]').forEach(el => {
                 el.classList.add('ddb-stat-attribute');
             });
@@ -473,13 +489,86 @@
         }
     }
 
-    function extractDocument(html, sourceUrl, fallbackTitle, namespace) {
+
+    function findFragmentTargetInNode(root, fragment) {
+        if (!fragment) return null;
+
+        let id;
+        try { id = decodeURIComponent(fragment.replace(/^#/, '')); }
+        catch { id = fragment.replace(/^#/, ''); }
+        if (!id) return null;
+
+        const allWithId = [...root.querySelectorAll('[id]')];
+        const byId = allWithId.find(el => el.id === id || el.id.toLowerCase() === id.toLowerCase());
+        if (byId) return byId;
+
+        return [...root.querySelectorAll('a[name]')]
+            .find(el => {
+                const name = el.getAttribute('name') || '';
+                return name === id || name.toLowerCase() === id.toLowerCase();
+            }) || null;
+    }
+
+    function entryHeadingForTarget(target) {
+        if (!target) return null;
+        if (/^H[1-6]$/.test(target.tagName)) return target;
+
+        const closest = target.closest?.('h1,h2,h3,h4,h5,h6');
+        if (closest) return closest;
+
+        const nested = target.querySelector?.('h1,h2,h3,h4,h5,h6');
+        if (nested) return nested;
+
+        let cursor = target;
+        for (let i = 0; i < 5 && cursor; i++) {
+            cursor = cursor.nextElementSibling;
+            if (cursor && /^H[1-6]$/.test(cursor.tagName)) return cursor;
+        }
+
+        return null;
+    }
+
+    function markIndexedEntryBoundaries(root, indexedEntries = []) {
+        const marked = new Set();
+
+        for (const entry of indexedEntries) {
+            if (!entry.fragment) continue;
+            const target = findFragmentTargetInNode(root, entry.fragment);
+            if (!target) continue;
+
+            const heading = entryHeadingForTarget(target);
+            const marker = heading || target;
+            if (marked.has(marker)) continue;
+            marked.add(marker);
+
+            marker.classList.add('ddb-content-entry-start');
+
+            // The opening line or two of a discrete entry often contains a
+            // subtitle, type, rarity, location metadata, or other compact
+            // identifying details. Keep these visually attached to the heading
+            // without making assumptions about what kind of D&D content it is.
+            let sibling = marker.nextElementSibling;
+            let tagged = 0;
+            while (sibling && tagged < 2) {
+                if (/^H[1-6]$/.test(sibling.tagName)) break;
+                if (sibling.matches('table,figure,picture,img,.ddb-art-block,.ddb-stat-block')) break;
+                const compactText = (sibling.textContent || '').replace(/\s+/g, ' ').trim();
+                if (!compactText || compactText.length > 260) break;
+                sibling.classList.add('ddb-entry-opening-part');
+                tagged += 1;
+                sibling = sibling.nextElementSibling;
+            }
+        }
+    }
+
+    function extractDocument(html, sourceUrl, fallbackTitle, namespace, indexedEntries = []) {
         const doc = parse(html);
         const article = findArticle(doc);
         if (!article) throw new Error('Could not locate sourcebook article content.');
         const node = cleanupContent(article, sourceUrl);
         groupArtwork(node);
         enhanceStatBlocks(node);
+        markIndexedEntryBoundaries(node, indexedEntries);
         const anchorMap = namespaceAnchors(node, namespace);
         return {
             title: article.querySelector('h1')?.textContent?.trim() || doc.querySelector('main h1')?.textContent?.trim() || fallbackTitle,
@@ -557,12 +646,23 @@ body{margin:0 auto;max-width:8in;padding:.28in;color:#111!important;font-size:10
 .ddb-generated-toc{break-after:page!important;page-break-after:always!important}.ddb-generated-toc ol,.ddb-generated-index ul{padding-left:1.35rem}.ddb-generated-toc li,.ddb-generated-index li{margin:.14rem 0}.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}
 .ddb-content-root,.ddb-major-page,.ddb-reference-document{width:100%;clear:both}
 .ddb-content-root *,.ddb-content-root *::before,.ddb-content-root *::after{break-before:auto!important;break-after:auto!important;page-break-before:auto!important;page-break-after:auto!important;break-inside:auto!important;page-break-inside:auto!important}
-.ddb-major-page{${CONFIG.majorPagesStartNewPage ? 'break-before:page!important;page-break-before:always!important;' : ''}}.ddb-reference-document+.ddb-reference-document{margin-top:1.25em}
+.ddb-major-page{${CONFIG.majorPagesStartNewPage ? 'break-before:page!important;page-break-before:always!important;' : ''}}
+.ddb-reference-document+.ddb-reference-document{margin-top:1.65em!important;padding-top:.75em!important;border-top:1px solid #b8aa96!important}
+.ddb-content-root h1{margin-top:1.65em!important;margin-bottom:.5em!important}
+.ddb-content-root h2{margin-top:1.4em!important;margin-bottom:.42em!important}
+.ddb-content-root h3{margin-top:1.15em!important;margin-bottom:.36em!important}
+.ddb-content-root h4,.ddb-content-root h5,.ddb-content-root h6{margin-top:.95em!important;margin-bottom:.3em!important}
+.ddb-content-entry-start{margin-top:1.55em!important;padding-top:.65em!important;border-top:1.35px solid rgba(125,35,30,.62)!important;break-after:avoid-page!important;page-break-after:avoid!important}
+.ddb-content-entry-start:first-child{margin-top:.35em!important}
+.ddb-content-entry-start+.ddb-entry-opening-part,.ddb-content-entry-start+.ddb-entry-opening-part+.ddb-entry-opening-part{break-before:avoid-page!important;page-break-before:avoid!important;break-after:avoid-page!important;page-break-after:avoid!important}
 p{orphans:3;widows:3}h1,h2,h3,h4,h5,h6{break-after:avoid-page!important;page-break-after:avoid!important;orphans:3;widows:3}h1+*,h2+*,h3+*,h4+*,h5+*,h6+*{break-before:avoid-page!important;page-break-before:avoid!important}
 ul,ol,li,blockquote,aside{break-inside:auto!important;page-break-inside:auto!important}
 table{width:100%;max-width:100%;border-collapse:collapse;break-inside:auto!important}thead{display:table-header-group}tfoot{display:table-footer-group}tr{break-inside:avoid-page!important;page-break-inside:avoid!important}th,td{vertical-align:top}
+.ddb-short-table{break-inside:avoid-page!important;page-break-inside:avoid!important}
+.ddb-short-table-heading{break-after:avoid-page!important;page-break-after:avoid!important;margin-bottom:.28em!important}
 figure,picture{max-width:100%!important;break-inside:auto!important;page-break-inside:auto!important;margin-left:auto;margin-right:auto}img,picture,svg,canvas{max-width:100%!important;height:auto!important}.ddb-content-root img{max-height:7.25in!important;object-fit:contain!important}
 .ddb-art-block{clear:both;break-inside:avoid-page!important;page-break-inside:avoid!important;margin:.35em 0 .75em}.ddb-art-block>:first-child{break-after:avoid-page!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:7.05in!important;margin:.15em auto 0!important}figcaption{text-align:center;break-before:avoid-page!important}
+
 .ddb-print-table{width:100%!important;border-collapse:collapse!important;border-spacing:0!important;margin:.45em 0 .8em!important;font-size:9.4pt!important;line-height:1.25!important;background:#fff!important}
 .ddb-print-table th,.ddb-print-table td{padding:.22em .42em!important;border:1px solid #777!important;text-align:left!important;vertical-align:top!important}
 .ddb-print-table thead th{font-weight:700!important;background:#ece9df!important;border-bottom:2px solid #555!important}
@@ -688,7 +788,7 @@ figure,picture{max-width:100%!important;break-inside:auto!important;page-break-i
                 const p = primaryPages[i]; setStatus(`Book pages ${i+1}/${primaryPages.length}: ${p.label}`);
                 try {
                     const html = await fetchHtml(p.url);
-                    primaryResults[i] = { ...extractDocument(html, p.url, p.label, p.id), sourceUrl:p.url, label:p.label };
+                    primaryResults[i] = { ...extractDocument(html, p.url, p.label, p.id, entries.filter(e => e.fetchUrl === withoutHash(p.url))), sourceUrl:p.url, label:p.label };
                 } catch (e) { primaryResults[i] = { error:e?.message || String(e), sourceUrl:p.url, label:p.label }; warn(e); }
                 if (i < primaryPages.length - 1) await sleep(delay());
             }
@@ -699,7 +799,7 @@ figure,picture{max-width:100%!important;break-inside:auto!important;page-break-i
                 const d = refs[i]; setStatus(`Indexed documents ${i+1}/${refs.length}: ${d.label}`);
                 try {
                     const html = await fetchHtml(d.url);
-                    refResults[i] = { ...extractDocument(html, d.url, d.label, d.id), sourceUrl:d.url, label:d.label };
+                    refResults[i] = { ...extractDocument(html, d.url, d.label, d.id, d.entries), sourceUrl:d.url, label:d.label };
                 } catch (e) { refResults[i] = { error:e?.message || String(e), sourceUrl:d.url, label:d.label }; warn(e); }
                 if (i < refs.length - 1) await sleep(delay());
             }
