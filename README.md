@@ -1,111 +1,167 @@
 # DDB Offline Sourcebook Builder
 
-A Tampermonkey userscript that builds a print-ready, offline-friendly version of a D&D Beyond sourcebook that your currently logged-in account can already access, then lets you save it as a PDF from the browser print dialog.
+A Tampermonkey userscript that builds a print-ready, offline-friendly copy of a D&D Beyond sourcebook or adventure that the currently logged-in browser session can already access, then opens it in a print preview so it can be saved as a PDF.
 
 > **Important:** This project does not bypass authentication, ownership checks, paywalls, or DRM. It only requests pages the current D&D Beyond browser session can already open. Use it only with content you are authorized to access and in accordance with applicable terms and law.
 
 ## Current version
 
-**v0.8.0**
+**v0.9.0**
 
-v0.8 adds mixed modern/legacy D&D Beyond source-path support for adventure books and refines v0.7 pagination efficiency while keeping the exporter structure-driven and book-agnostic.
+v0.9 is a presentation-polish release based on testing both the 2024 Monster Manual and *Dragonlance: Shadow of the Dragon Queen*. It keeps the downloader book-agnostic and adds better reference indexes, safer artwork association, printable callouts/read-aloud text, and preservation/reconstruction of flow/card layouts.
 
 ## Design principle
 
-This project is intentionally **not tailored to individual books**.
+The exporter is intentionally **not tailored to individual books**.
 
-The Monster Manual is useful as a stress test because it contains hundreds of indexed entries, but the script is designed around reusable document semantics rather than checks such as `if book === Monster Manual`.
+The Monster Manual is a useful stress test because it contains hundreds of indexed stat blocks. Adventure books stress different parts of the system: chapters, read-aloud text, encounter tables, maps, appendices, NPCs, magic items, flowcharts, and mixed modern/legacy D&D Beyond URLs.
 
-Where possible, the builder reacts to structural features such as:
+The builder therefore reacts to document structure and features rather than book titles.
 
-- table-of-contents pages;
+Examples:
+
+- table-of-contents structure;
+- modern and legacy source-path aliases;
 - indexed/reference links;
-- fragment targets;
+- `#fragment` targets;
 - heading hierarchy;
 - short versus long tables;
-- structured stat/rules blocks;
-- artwork and captions;
+- structured rules/stat blocks;
+- callout/read-aloud containers;
+- card/grid/flowchart containers;
+- artwork and artist credits;
 - source-document boundaries.
 
-That same logic is intended to work across adventures, rulebooks, setting books, bestiaries, character-option books, and future D&D Beyond source layouts.
+There are no `if book === "Monster Manual"` or `if book === "Shadow of the Dragon Queen"` branches.
 
 ## Highlights
 
 - Works from D&D Beyond sourcebook landing pages under `/sources/...`.
-- Supports newer `/sources/dnd/...` paths and older source paths.
-- Discovers ordinary table-of-contents pages.
-- Detects large index/reference sections such as stat-block indexes, spell references, magic items, feats, backgrounds, species, glossary/reference sections, and similar linked material.
-- Preserves `#fragment` targets.
-- Groups indexed links by their **underlying source document**.
-- Downloads each underlying HTML document only once per run.
-- Prevents grouped parent/child entries from being appended repeatedly.
-- Namespaces captured HTML anchors to reduce ID collisions when many pages are merged.
-- Rewrites captured navigation to offline document anchors when possible.
-- Resolves common lazy-loaded images and waits for images/fonts before enabling printing.
+- Supports both newer `/sources/dnd/<slug>` landing pages and older `/sources/<slug>/...` chapter routes.
+- Discovers normal book/chapter pages from the landing-page table of contents.
+- Detects reference/index sections such as stat blocks, creatures, NPCs, sidekicks, magic items, feats, backgrounds, species, glossary/reference sections, and similar linked material.
+- Preserves fragment targets and converts captured links to internal PDF/document links where possible.
+- Groups indexed links by the **underlying source document** and downloads each underlying HTML document only once.
+- Avoids duplicate parent/child content caused by repeatedly appending fragment targets from the same source page.
+- Namespaces captured IDs/anchors to reduce collisions after many pages are merged.
+- Resolves common lazy-loaded images and waits for images/fonts before enabling print.
 - Produces US Letter print-oriented output.
-- Keeps the Capture Report visible in the preview while hiding it from printed/PDF output by default.
+- Keeps the diagnostic Capture Report in the preview while hiding it from PDF/physical print by default.
 
-## v0.8 adventure compatibility and pagination efficiency
+## v0.9 print polish
 
-v0.8 supports D&D Beyond books whose landing page uses `/sources/dnd/<slug>` while actual chapter pages still use `/sources/<slug>/...`. The builder treats both path forms as aliases for the same book instead of hard-coding individual adventure titles.
+### Reference Index
 
-Additional changes:
+Generated linked material is now clearly separated from the ordinary table of contents under a **Reference Index** heading.
 
-- large generated indexes with 80+ entries print in two columns;
-- indexed-entry headings keep only one compact opening metadata line attached, reducing unnecessary whitespace;
-- artwork/credit grouping is less aggressive and maximum print image height is slightly reduced;
-- generic `Creatures`, `NPCs`, and `Sidekicks` headings can participate in reference discovery;
-- existing v0.5 duplicate prevention, v0.6 table reconstruction, and v0.7 entry spacing remain intact.
+Column count is selected from the total number of discovered reference entries:
 
-## v0.7 generic print polish
+| Reference entries | Layout |
+| ---: | --- |
+| 0–30 | 1 column |
+| 31–180 | 2 columns |
+| 181+ | 3 columns |
 
-v0.7 improves readability without assuming that an indexed entry is specifically a monster, spell, item, NPC, location, or encounter.
+This keeps small adventure indexes readable while making very large bestiary/spell/item indexes substantially more compact.
 
-### Discrete entry spacing
+Repeated reference groups with the same normalized heading are merged in the generated index while preserving entry order.
 
-When an index/reference link points to a fragment inside a captured source document, the script marks that target as a generic content-entry boundary.
+### Artwork and artist credits
 
-The print stylesheet then adds:
+When the exporter confidently detects a short artist/studio credit immediately before an image, the credit and artwork are grouped as one print unit.
 
-- additional top spacing;
+v0.9 uses a more conservative artist-name heuristic than earlier versions so ordinary short adventure text is less likely to be mistaken for a credit.
+
+Credited artwork is capped to a smaller print height than unrestricted artwork, which helps the credit and its image stay together without creating as many sparse pages.
+
+### Callouts and read-aloud text
+
+The builder identifies common structural classes used for:
+
+- read-aloud/boxed text;
+- sidebars;
+- rule callouts;
+- notes;
+- quote boxes;
+- similar semantic callout containers.
+
+These receive a print-safe background, left rule, padding, and page-break protection. Read-aloud containers receive italic treatment.
+
+The logic is class/structure driven and does not depend on a specific adventure title.
+
+### Flowcharts and card/grid layouts
+
+The builder preserves containers whose classes advertise grid/card/flow layout.
+
+If a section explicitly labels itself as a **flowchart** but the source is represented as ordinary lower-level heading/text siblings, v0.9 can reconstruct those repeated groups into a two-column print grid.
+
+This is useful for adventure-flow diagrams and similar structured reference sections while remaining feature-driven.
+
+## Adventure/source path compatibility
+
+Some D&D Beyond books use mixed URL layouts. A landing page can use:
+
+```text
+/sources/dnd/<slug>
+```
+
+while its actual chapter pages use:
+
+```text
+/sources/<slug>/<chapter>
+```
+
+The exporter derives both roots from the book slug and treats them as aliases for the same book.
+
+This fixed adventure books that previously failed with:
+
+```text
+No sourcebook pages found. Open the book main Contents page.
+```
+
+## Generic entry spacing
+
+When an index/reference link points to a fragment inside a captured source document, the exporter marks that fragment target as a generic discrete-entry boundary.
+
+That gives monsters, spells, items, NPCs, locations, encounters, feats, backgrounds, and similar reference entries:
+
+- extra breathing room;
 - a subtle divider;
-- stronger visual separation from the previous entry;
-- page-break hints to keep the heading attached to the opening metadata when practical.
+- heading-to-opening-line page-break hints.
 
-This applies equally to monsters, spells, items, feats, backgrounds, NPCs, locations, rules references, and other indexed content.
+Only one compact opening metadata/subtitle line is preferentially kept with the heading. The entire entry remains free to span pages naturally.
 
-### Heading hierarchy
-
-Captured sourcebook content receives more consistent spacing for `h1` through `h6` headings so adjacent sections do not visually run together.
-
-Major headings receive more breathing room than lower-level subsections while still being allowed to flow naturally across printed pages.
+## Table handling
 
 ### Short tables
 
-Tables with up to 12 rows are treated as compact reference tables and are preferentially kept on one printed page.
+HTML tables with up to 12 rows are preferentially kept together on one page. A nearby table heading is also kept with the table when practical.
 
-A nearby table heading is also kept with the table when practical.
+This works well for:
 
-This is useful for:
-
-- d6/d8/d10/d12 random tables;
-- encounter tables;
+- random encounters;
 - rumors;
 - complications;
-- small treasure tables;
-- NPC traits;
 - appearance tables;
-- other compact lookup tables.
+- treasure tables;
+- small lookup tables.
 
-Long tables remain splittable and retain repeated table headers where the browser supports them.
+Long tables remain splittable.
 
-## v0.6 stat-block and table improvements
+### Ordinary tables
 
-v0.6 no longer relies entirely on D&D Beyond's screen-oriented table layout surviving browser printing.
+Captured HTML tables receive consistent print styling:
 
-### Ability scores
+- visible borders;
+- shaded header rows;
+- alternating row shading;
+- repeated table headers across printed pages where supported;
+- compact die/result columns;
+- row-level page-break protection where practical.
 
-When the source markup exposes parseable ability-score tables, the script combines the common split layout into one compact six-ability print table:
+### Ability-score/stat-block tables
+
+When a source stat block exposes parseable STR/DEX/CON/INT/WIS/CHA tables, the exporter combines the common split layout into one compact six-ability print table:
 
 |  | STR | DEX | CON | INT | WIS | CHA |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -113,34 +169,15 @@ When the source markup exposes parseable ability-score tables, the script combin
 | Mod | +5 | -1 | +2 | +4 | +2 | +4 |
 | Save | +5 | +3 | +6 | +8 | +6 | +4 |
 
-The original source ability tables are hidden **only when all six abilities are parsed successfully**. If reconstruction is incomplete, the original table remains visible rather than silently dropping information.
+The original ability tables are hidden **only after** a complete six-ability replacement is successfully reconstructed.
 
-### Stat-block details
-
-Known D&D Beyond stat-block label/value rows are given a consistent print grid for fields such as Armor Class, Hit Points, Speed, Skills, Senses, Languages, Challenge Rating, resistances, immunities, and similar details when the source markup exposes the expected classes.
-
-Traits, Actions, Bonus Actions, Reactions, Legendary Actions, and similar stat-block section headings receive a visually distinct print treatment when D&D Beyond exposes the expected description-heading classes.
-
-Large stat blocks are still allowed to span multiple sheets naturally.
-
-### Ordinary sourcebook tables
-
-Captured HTML tables receive consistent print styling:
-
-- visible cell borders;
-- shaded header rows;
-- alternating row shading;
-- repeated table headers across printed pages where the browser supports it;
-- compact first columns for dice/random-result tables;
-- row-level page-break protection where practical.
-
-This applies to random tables, challenge-rating tables, lookup tables, encounter tables, and similar book content.
+Older stat-block formats are left intact when the transformer cannot confidently reconstruct them.
 
 ## Why indexes are treated as navigation
 
-Large indexes cannot safely be handled by appending every logical entry as a separate copy.
+A large index might contain hundreds of logical entries while those entries live in only a few underlying HTML documents.
 
-For example, links such as:
+For example:
 
 ```text
 /reference-page#entry-a
@@ -148,7 +185,7 @@ For example, links such as:
 /reference-page#entry-c
 ```
 
-can all live in the same underlying HTML document:
+all belong to:
 
 ```text
 /reference-page
@@ -157,7 +194,7 @@ can all live in the same underlying HTML document:
 The builder therefore uses this model:
 
 ```text
-logical index links
+logical reference links
         ↓
 normalize underlying URLs
         ↓
@@ -167,68 +204,72 @@ fetch each document once
         ↓
 include each document once
         ↓
-rewrite index links to local anchors
+rewrite reference links to local anchors
 ```
 
-This avoids duplicate content while preserving offline navigation.
+This prevents duplicate content while retaining offline navigation.
 
 ## Print-first pagination
 
-The script neutralizes inherited `break-before`, `break-after`, `break-inside`, and legacy `page-break-*` rules inside captured sourcebook content, then applies book-style print rules.
+The script neutralizes inherited `break-before`, `break-after`, `break-inside`, and legacy `page-break-*` rules inside captured source content, then applies its own print-oriented rules.
 
 It also:
 
 - uses a simple block-layout cover;
-- lets normal prose and subsections flow naturally;
-- allows large stat/rules blocks to span pages;
-- keeps headings with following content where practical;
-- gives discrete indexed entries additional visual separation;
-- keeps compact tables intact where practical;
-- limits artwork to the printable page height;
-- groups short artist credits with following artwork when that pattern is detected;
-- hides the diagnostic Capture Report from printed/PDF output by default.
+- lets normal prose flow naturally;
+- lets large stat/rules blocks span pages;
+- keeps headings with nearby opening content when practical;
+- separates discrete indexed entries visually;
+- protects compact tables;
+- constrains large artwork to printable page height;
+- keeps confidently detected artist credits with their artwork;
+- hides the Capture Report from the printed PDF.
+
+Major chapter/source pages can still start on a new sheet.
 
 ## Requirements
 
 - Chrome, Edge, Firefox, or another browser supported by Tampermonkey.
 - [Tampermonkey](https://www.tampermonkey.net/) installed.
 - A D&D Beyond account logged into the browser.
-- Access to the sourcebook being exported.
+- Access to the sourcebook/adventure being exported.
 
 ## Installation / update
 
 Open the raw userscript:
 
-`https://raw.githubusercontent.com/EnderGotGame/ddb-offline-sourcebook-builder/main/ddb-offline-sourcebook-builder.user.js`
+```text
+https://raw.githubusercontent.com/EnderGotGame/ddb-offline-sourcebook-builder/main/ddb-offline-sourcebook-builder.user.js
+```
 
 If Tampermonkey recognizes it, choose **Install** or **Update**.
 
 If it opens as plain text:
 
 1. Open **Tampermonkey → Dashboard**.
-2. Open your existing **DDB Offline Sourcebook Builder** script.
+2. Open your existing **DDB Offline Sourcebook Builder**.
 3. Select everything in the editor.
-4. Replace it with the contents of `ddb-offline-sourcebook-builder.user.js` from this repository.
+4. Replace it with the complete contents of `ddb-offline-sourcebook-builder.user.js`.
 5. Save with **Ctrl+S**.
-6. Confirm the metadata header shows:
+6. Confirm the header says:
 
 ```javascript
-// @version      0.8.0
+// @version      0.9.0
 ```
 
-7. Reload the D&D Beyond sourcebook page.
+7. Reload the D&D Beyond book landing page.
 
-Do not manually merge v0.7 functions into an older copy; replace the entire userscript.
+Replace the whole userscript when updating. Do not manually merge individual functions from older versions.
 
 ## Usage
 
 1. Sign in to D&D Beyond.
-2. Open the **main landing/Contents page** of a sourcebook you can access.
-3. Reload after installing/updating the userscript.
-4. Click **Build Offline PDF** in the lower-right corner.
+2. Open the book's **main landing / Contents page**.
+3. Reload the page after installing/updating the userscript.
+4. Click **Build Offline PDF** in the lower-right.
 5. Allow popups for `www.dndbeyond.com` if required.
 6. Leave the original D&D Beyond tab open while the builder runs.
-7. Wait until the generated preview finishes loading images.
+7. Wait for the generated preview to finish loading images.
 8. Review the preview and Capture Report.
 9. Click **Print / Save PDF**.
 
@@ -253,11 +294,11 @@ The preview reports:
 - Unique HTML documents requested
 - Capture failures
 
-By default the Capture Report is hidden when printing or saving the book as PDF.
+The Capture Report is hidden from printed/PDF output by default.
 
 ## Configuration
 
-Near the top of the script:
+Near the top of the userscript:
 
 ```javascript
 const CONFIG = {
@@ -284,6 +325,15 @@ Do not set request delays to zero for large books. The downloader intentionally 
 - Open the book's main Contents/landing page, not an individual chapter.
 - Reload after updating the script.
 
+### `No sourcebook pages found`
+
+v0.8+ supports mixed modern/legacy source roots. If this still happens:
+
+- reload the main Contents page;
+- verify the visible URL is the book landing page;
+- open DevTools → Console and look for `[DDB PDF] Detected source roots`;
+- report the landing-page URL and one chapter URL.
+
 ### Popup is blocked
 
 Allow popups for `www.dndbeyond.com`, then run the builder again.
@@ -298,15 +348,15 @@ Open the same target normally while logged in and verify that the account has ac
 
 ### A stat block did not get a reconstructed ability table
 
-The transformer is deliberately conservative. It only replaces the source ability layout when all six ability scores, modifiers, and save values can be parsed from the captured table markup. If D&D Beyond changes that markup, the original data remains visible rather than being discarded.
+The transformer is conservative. It only replaces the source ability layout when all six abilities can be parsed safely. If the markup differs, the original data remains visible.
 
-### A normal table still looks wrong
+### A table still looks wrong
 
-Report the book/section and generated PDF page. Different sourcebooks sometimes use non-table div/grid components that may need an additional semantic print transformer.
+Report the book, section name, and generated PDF page. Some D&D Beyond components are grid/div structures rather than semantic HTML tables.
 
-### A short table still splits
+### A callout/read-aloud box is not recognized
 
-The script protects compact HTML tables with up to 12 rows, but browser pagination can still override this when the table is physically taller than the printable area or when D&D Beyond uses a non-table grid component.
+Report the book and generated PDF page. The exporter currently relies on semantic class/structure cues and intentionally avoids guessing based on book-specific text.
 
 ## Privacy and security
 
@@ -314,7 +364,7 @@ The script protects compact HTML tables with up to 12 rows, but browser paginati
 - Uses the browser's existing authenticated D&D Beyond session.
 - Does not request or store your D&D Beyond password.
 - Does not upload captured book content to this repository.
-- The repository contains only the userscript and documentation, not sourcebook PDFs or book text.
+- The repository contains only the userscript and documentation, not sourcebook PDFs or copyrighted book text.
 
 ## Project scope
 
