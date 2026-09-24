@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DDB Offline Sourcebook Builder
 // @namespace    https://tampermonkey.net/
-// @version      0.5.0
+// @version      0.6.0
 // @description  Build a print-ready offline PDF from D&D Beyond sourcebooks your logged-in account can access.
 // @author       Brandon / OpenAI
 // @match        https://www.dndbeyond.com/sources/*
@@ -348,12 +348,138 @@
         return map;
     }
 
+    function normalizeMinus(value = '') {
+        return String(value).replace(/[−–—]/g, '-');
+    }
+
+    function parseAbilityRowsFromTable(table) {
+        const text = normalizeMinus(table.textContent || '').replace(/\s+/g, ' ').trim();
+        const rows = [];
+        const re = /\b(Str|Dex|Con|Int|Wis|Cha)\b\s*(\d+)\s*([+-]\d+)\s*([+-]\d+)/gi;
+        let match;
+        while ((match = re.exec(text)) !== null) {
+            rows.push({
+                ability: match[1].toUpperCase(),
+                score: match[2],
+                mod: match[3],
+                save: match[4]
+            });
+        }
+        return rows;
+    }
+
+    function buildAbilityTable(doc, rows) {
+        const order = ['STR', 'DEX', 'CON', 'INT', 'WIS', 'CHA'];
+        const byAbility = new Map(rows.map(r => [r.ability, r]));
+        if (!order.every(a => byAbility.has(a))) return null;
+
+        const table = doc.createElement('table');
+        table.className = 'ddb-ability-table';
+
+        const thead = doc.createElement('thead');
+        const headRow = doc.createElement('tr');
+        headRow.innerHTML = '<th scope="col">&nbsp;</th>' + order.map(a => `<th scope="col">${a}</th>`).join('');
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+
+        const tbody = doc.createElement('tbody');
+        for (const [label, key] of [['Score', 'score'], ['Mod', 'mod'], ['Save', 'save']]) {
+            const tr = doc.createElement('tr');
+            tr.innerHTML = `<th scope="row">${label}</th>` + order.map(a => `<td>${byAbility.get(a)[key]}</td>`).join('');
+            tbody.appendChild(tr);
+        }
+        table.appendChild(tbody);
+        return table;
+    }
+
+    function classifyOrdinaryTables(root) {
+        for (const table of root.querySelectorAll('table')) {
+            table.classList.add('ddb-print-table');
+            const text = normalizeMinus(table.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/\b(Str|Dex|Con|Int|Wis|Cha)\b/i.test(text) && /\b(Mod|Save|Ability Score)\b/i.test(text)) {
+                table.classList.add('ddb-ability-source-table');
+            } else if (/\b1d\d+\b/i.test(text) || /^d\d+\b/i.test(text)) {
+                table.classList.add('ddb-roll-table');
+            }
+        }
+    }
+
+    function enhanceStatBlocks(root) {
+        classifyOrdinaryTables(root);
+
+        const candidates = [...root.querySelectorAll([
+            '.mon-stat-block',
+            '.monster-stat-block',
+            '[class*="mon-stat-block"]',
+            '[class*="monster-stat-block"]',
+            '[class*="stat-block"]'
+        ].join(','))];
+
+        const blocks = candidates.filter(el => !el.parentElement?.closest([
+            '.mon-stat-block',
+            '.monster-stat-block',
+            '[class*="mon-stat-block"]',
+            '[class*="monster-stat-block"]',
+            '[class*="stat-block"]'
+        ].join(',')));
+
+        for (const block of blocks) {
+            block.classList.add('ddb-stat-block');
+
+            const sourceTables = [...block.querySelectorAll('table')];
+            const rows = sourceTables.flatMap(parseAbilityRowsFromTable);
+            const unique = [];
+            const seen = new Set();
+            for (const row of rows) {
+                if (!seen.has(row.ability)) {
+                    seen.add(row.ability);
+                    unique.push(row);
+                }
+            }
+
+            if (unique.length >= 6) {
+                const merged = buildAbilityTable(block.ownerDocument, unique);
+                if (merged) {
+                    const abilityTables = sourceTables.filter(t => parseAbilityRowsFromTable(t).length > 0);
+                    const first = abilityTables[0];
+                    if (first) {
+                        first.parentNode.insertBefore(merged, first);
+                        abilityTables.forEach(t => t.classList.add('ddb-source-ability-table'));
+                    }
+                }
+            }
+
+            block.querySelectorAll('.mon-stat-block__attribute,[class*="stat-block__attribute"]').forEach(el => {
+                el.classList.add('ddb-stat-attribute');
+            });
+            block.querySelectorAll('.mon-stat-block__attribute-label,[class*="attribute-label"]').forEach(el => {
+                el.classList.add('ddb-stat-label');
+            });
+            block.querySelectorAll('.mon-stat-block__attribute-value,.mon-stat-block__attribute-data,[class*="attribute-value"],[class*="attribute-data"]').forEach(el => {
+                el.classList.add('ddb-stat-value');
+            });
+            block.querySelectorAll('.mon-stat-block__tidbit,[class*="stat-block__tidbit"]').forEach(el => {
+                el.classList.add('ddb-stat-detail-row');
+            });
+            block.querySelectorAll('.mon-stat-block__tidbit-label,[class*="tidbit-label"]').forEach(el => {
+                el.classList.add('ddb-stat-label');
+            });
+            block.querySelectorAll('.mon-stat-block__tidbit-data,[class*="tidbit-data"]').forEach(el => {
+                el.classList.add('ddb-stat-value');
+            });
+            block.querySelectorAll('.mon-stat-block__description-block-heading,[class*="description-block-heading"]').forEach(el => {
+                el.classList.add('ddb-stat-section-heading');
+            });
+        }
+    }
+
     function extractDocument(html, sourceUrl, fallbackTitle, namespace) {
         const doc = parse(html);
         const article = findArticle(doc);
         if (!article) throw new Error('Could not locate sourcebook article content.');
         const node = cleanupContent(article, sourceUrl);
         groupArtwork(node);
+        enhanceStatBlocks(node);
         const anchorMap = namespaceAnchors(node, namespace);
         return {
             title: article.querySelector('h1')?.textContent?.trim() || doc.querySelector('main h1')?.textContent?.trim() || fallbackTitle,
@@ -437,6 +563,21 @@ ul,ol,li,blockquote,aside{break-inside:auto!important;page-break-inside:auto!imp
 table{width:100%;max-width:100%;border-collapse:collapse;break-inside:auto!important}thead{display:table-header-group}tfoot{display:table-footer-group}tr{break-inside:avoid-page!important;page-break-inside:avoid!important}th,td{vertical-align:top}
 figure,picture{max-width:100%!important;break-inside:auto!important;page-break-inside:auto!important;margin-left:auto;margin-right:auto}img,picture,svg,canvas{max-width:100%!important;height:auto!important}.ddb-content-root img{max-height:7.25in!important;object-fit:contain!important}
 .ddb-art-block{clear:both;break-inside:avoid-page!important;page-break-inside:avoid!important;margin:.35em 0 .75em}.ddb-art-block>:first-child{break-after:avoid-page!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:7.05in!important;margin:.15em auto 0!important}figcaption{text-align:center;break-before:avoid-page!important}
+.ddb-print-table{width:100%!important;border-collapse:collapse!important;border-spacing:0!important;margin:.45em 0 .8em!important;font-size:9.4pt!important;line-height:1.25!important;background:#fff!important}
+.ddb-print-table th,.ddb-print-table td{padding:.22em .42em!important;border:1px solid #777!important;text-align:left!important;vertical-align:top!important}
+.ddb-print-table thead th{font-weight:700!important;background:#ece9df!important;border-bottom:2px solid #555!important}
+.ddb-print-table tbody tr:nth-child(even)>td,.ddb-print-table tbody tr:nth-child(even)>th{background:#f7f5ef!important}
+.ddb-roll-table th:first-child,.ddb-roll-table td:first-child{width:11%!important;text-align:center!important;white-space:nowrap!important}
+.ddb-source-ability-table{display:none!important}
+.ddb-ability-table{width:100%!important;table-layout:fixed!important;border-collapse:collapse!important;margin:.45em 0 .75em!important;font-size:9pt!important;line-height:1.15!important;break-inside:avoid-page!important;page-break-inside:avoid!important}
+.ddb-ability-table th,.ddb-ability-table td{border:1px solid #555!important;padding:.22em .18em!important;text-align:center!important;vertical-align:middle!important}
+.ddb-ability-table thead th{background:#2e2e2e!important;color:#fff!important;font-weight:700!important;letter-spacing:.02em!important}
+.ddb-ability-table tbody th{background:#e8e5dc!important;text-align:left!important;font-weight:700!important;width:12%!important}
+.ddb-ability-table tbody tr:nth-child(even) td{background:#f7f5ef!important}
+.ddb-stat-block{border-top:2px solid #8b1e1e!important;border-bottom:2px solid #8b1e1e!important;padding:.45em .55em .55em!important;margin:.45em 0 1em!important;background:#fffdf8!important}
+.ddb-stat-attribute,.ddb-stat-detail-row{display:grid!important;grid-template-columns:minmax(5.6em,auto) 1fr!important;gap:.35em!important;align-items:start!important;padding:.14em .22em!important;border-bottom:1px solid #ddd6c8!important}
+.ddb-stat-label{font-weight:700!important;white-space:nowrap!important}.ddb-stat-value{min-width:0!important}
+.ddb-stat-section-heading{margin:.65em 0 .25em!important;padding:.18em .28em!important;font-weight:800!important;text-transform:uppercase!important;letter-spacing:.035em!important;border-top:1px solid #8b1e1e!important;border-bottom:1px solid #8b1e1e!important;background:#f0e6d7!important;break-after:avoid-page!important;page-break-after:avoid!important}
 .mon-stat-block,.monster-stat-block,[class*="mon-stat-block"],[class*="monster-stat-block"],[class*="stat-block"]{break-inside:auto!important;page-break-inside:auto!important}.mon-stat-block p,.monster-stat-block p,[class*="stat-block"] p,.mon-stat-block li,.monster-stat-block li,[class*="stat-block"] li{break-inside:avoid-page!important;page-break-inside:avoid!important}
 .compendium-image-left,.monster-image-left{float:left;margin:.25rem 1rem .5rem 0}.compendium-image-right,.monster-image-right{float:right;margin:.25rem 0 .5rem 1rem}.compendium-center-banner-img{width:100%!important}
 .ddb-error{margin:1rem 0;padding:.75rem;border:1px solid #999;font-family:Arial,sans-serif;break-inside:avoid-page!important}.ddb-report{break-before:page!important;page-break-before:always!important;font:9pt Arial,sans-serif}.ddb-report table{width:auto}
