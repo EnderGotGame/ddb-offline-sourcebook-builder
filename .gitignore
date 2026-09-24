@@ -1,0 +1,12 @@
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local output - do not commit generated copyrighted exports
+*.pdf
+exports/
+output/
