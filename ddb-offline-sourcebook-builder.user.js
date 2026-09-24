@@ -1,34 +1,16 @@
 // ==UserScript==
 // @name         DDB Offline Sourcebook Builder
 // @namespace    https://tampermonkey.net/
-// @version      0.4.0
-// @description  Build a print-ready offline PDF from D&D Beyond sourcebook content your logged-in account can access.
+// @version      0.5.0
+// @description  Build a print-ready offline PDF from D&D Beyond sourcebooks your logged-in account can access.
 // @author       Brandon / OpenAI
 // @match        https://www.dndbeyond.com/sources/*
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
-(function () {
+(() => {
     'use strict';
-
-    /*
-     * DDB Offline Sourcebook Builder v0.4
-     *
-     * Design goals:
-     *  - Works with ordinary sourcebook chapter pages.
-     *  - Detects index/reference sections such as "Index of Stat Blocks".
-     *  - Preserves #fragment targets instead of throwing them away.
-     *  - Fetches each unique HTML document only once.
-     *  - Pulls in indexed/reference entries when they are not already part of
-     *    an included sourcebook page.
-     *  - Rewrites captured D&D Beyond links to offline anchors.
-     *  - Produces print-first CSS: natural text flow, clean tables, sensible
-     *    stat-block splitting, and no forced page break for every indexed item.
-     *
-     * This script does not bypass ownership, authentication, paywalls, or DRM.
-     * It only requests pages that the current logged-in browser session can open.
-     */
 
     const CONFIG = {
         minPageDelay: 900,
@@ -37,34 +19,24 @@
         requestTimeoutMs: 30000,
         majorPagesStartNewPage: true,
         includeSiteCss: true,
-        maxIndexedEntries: 1200,
+        includeCaptureReportInPrint: false,
+        maxIndexedLinks: 1400,
         debug: true
     };
 
     const state = {
         running: false,
         cancelled: false,
-        fetchCache: new Map(),
-        failures: []
+        fetchCache: new Map()
     };
 
-    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const log = (...a) => CONFIG.debug && console.info('[DDB PDF]', ...a);
+    const warn = (...a) => console.warn('[DDB PDF]', ...a);
+    const delay = () => CONFIG.minPageDelay + Math.random() * (CONFIG.maxPageDelay - CONFIG.minPageDelay);
 
-    function randomDelay() {
-        return CONFIG.minPageDelay +
-            Math.random() * (CONFIG.maxPageDelay - CONFIG.minPageDelay);
-    }
-
-    function log(...args) {
-        if (CONFIG.debug) console.info('[DDB PDF]', ...args);
-    }
-
-    function warn(...args) {
-        console.warn('[DDB PDF]', ...args);
-    }
-
-    function escapeHtml(value = '') {
-        return String(value)
+    function escapeHtml(v = '') {
+        return String(v)
             .replaceAll('&', '&amp;')
             .replaceAll('<', '&lt;')
             .replaceAll('>', '&gt;')
@@ -72,8 +44,8 @@
             .replaceAll("'", '&#039;');
     }
 
-    function slugify(value = '') {
-        const out = String(value)
+    function slugify(v = '') {
+        return String(v)
             .toLowerCase()
             .normalize('NFKD')
             .replace(/[\u0300-\u036f]/g, '')
@@ -81,1402 +53,536 @@
             .trim()
             .replace(/\s+/g, '-')
             .replace(/-+/g, '-')
-            .slice(0, 120);
-
-        return out || 'entry';
-    }
-
-    function cleanBookTitle() {
-        return document.title
-            .replace(/\s*[-|]\s*D&D Beyond.*$/i, '')
-            .trim() || 'D&D Beyond Sourcebook';
+            .slice(0, 100) || 'section';
     }
 
     function absoluteUrl(url, base = location.href) {
-        if (!url) return '';
-        if (/^(data:|blob:|mailto:|javascript:)/i.test(url)) return url;
-        try {
-            return new URL(url, base).href;
-        } catch {
-            return url;
+        if (!url || /^(data:|blob:|mailto:|javascript:)/i.test(url)) return url || '';
+        try { return new URL(url, base).href; } catch { return url; }
+    }
+
+    function withoutHash(url) {
+        const u = new URL(url, location.href);
+        u.hash = '';
+        return u.href;
+    }
+
+    function comparableUrl(url) {
+        const u = new URL(url, location.href);
+        ['utm_source', 'utm_medium', 'utm_campaign'].forEach(k => u.searchParams.delete(k));
+        return u.href;
+    }
+
+    function cleanBookTitle() {
+        for (const el of [
+            document.querySelector('main h1'),
+            document.querySelector('.compendium-toc-full-header h1')
+        ]) {
+            const text = el?.textContent?.trim();
+            if (text && !/^sources$/i.test(text) && text.length < 140) return text;
         }
-    }
-
-    function urlWithoutHash(url) {
-        const parsed = new URL(url, location.href);
-        parsed.hash = '';
-        return parsed.href;
-    }
-
-    function normalizeComparableUrl(url) {
-        const parsed = new URL(url, location.href);
-        parsed.searchParams.delete('utm_source');
-        parsed.searchParams.delete('utm_medium');
-        parsed.searchParams.delete('utm_campaign');
-        return parsed.href;
-    }
-
-    function headingLevel(el) {
-        if (!el || !/^H[1-6]$/i.test(el.tagName)) return 99;
-        return Number(el.tagName.slice(1));
-    }
-
-    function elementComesBefore(a, b) {
-        if (!a || !b || a === b) return false;
-        return Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
-    }
-
-    function isVisibleText(el) {
-        return Boolean(el && el.textContent && el.textContent.trim());
+        return document.title.split(/\s+-\s+/)[0]?.trim() || 'D&D Beyond Sourcebook';
     }
 
     function determineBookRoot() {
-        const parts = location.pathname.split('/').filter(Boolean);
-        if (parts[0] !== 'sources') return null;
-        if (parts[1] === 'dnd' && parts.length >= 3) {
-            return '/' + parts.slice(0, 3).join('/');
-        }
-        if (parts.length >= 2) {
-            return '/' + parts.slice(0, 2).join('/');
-        }
+        const p = location.pathname.split('/').filter(Boolean);
+        if (p[0] !== 'sources') return null;
+        if (p[1] === 'dnd' && p[2]) return '/' + p.slice(0, 3).join('/');
+        if (p[1]) return '/' + p.slice(0, 2).join('/');
         return null;
     }
 
-    function isBookLandingPage(bookRoot) {
-        const a = location.pathname.replace(/\/+$/, '');
-        const b = bookRoot.replace(/\/+$/, '');
-        return a === b;
+    function isLandingPage(root) {
+        return location.pathname.replace(/\/+$/, '') === root.replace(/\/+$/, '');
     }
 
-    function isSameBookUrl(url, bookRoot) {
+    function isSameBook(url, root) {
         try {
             const u = new URL(url, location.href);
-            return u.origin === location.origin &&
-                (u.pathname === bookRoot || u.pathname.startsWith(bookRoot + '/'));
-        } catch {
-            return false;
-        }
+            return u.origin === location.origin && (u.pathname === root || u.pathname.startsWith(root + '/'));
+        } catch { return false; }
     }
 
-    function getMain() {
-        return document.querySelector('main') || document.body;
-    }
+    function mainEl() { return document.querySelector('main') || document.body; }
+    function headingLevel(el) { return /^H[1-6]$/.test(el?.tagName || '') ? Number(el.tagName.slice(1)) : 99; }
 
-    function findHeadingByText(regex) {
-        return [...getMain().querySelectorAll('h1,h2,h3,h4,h5,h6')]
-            .find(h => regex.test(h.textContent.trim()));
-    }
-
-    function elementsWithinHeadingRange(heading, selector = 'a[href]') {
+    function elementsAfterHeading(heading, selector = 'a[href]') {
         if (!heading) return [];
-
-        const main = getMain();
-        const allHeadings = [...main.querySelectorAll('h1,h2,h3,h4,h5,h6')];
+        const main = mainEl();
+        const headings = [...main.querySelectorAll('h1,h2,h3,h4,h5,h6')];
         const level = headingLevel(heading);
-        const startIndex = allHeadings.indexOf(heading);
-
+        const start = headings.indexOf(heading);
         let boundary = null;
-        for (let i = startIndex + 1; i < allHeadings.length; i++) {
-            if (headingLevel(allHeadings[i]) <= level) {
-                boundary = allHeadings[i];
-                break;
-            }
+        for (let i = start + 1; i < headings.length; i++) {
+            if (headingLevel(headings[i]) <= level) { boundary = headings[i]; break; }
         }
-
         return [...main.querySelectorAll(selector)].filter(el => {
-            if (!elementComesBefore(heading, el)) return false;
-            if (boundary && !elementComesBefore(el, boundary)) return false;
-            return true;
+            const afterStart = heading.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING;
+            const beforeBoundary = !boundary || (el.compareDocumentPosition(boundary) & Node.DOCUMENT_POSITION_FOLLOWING);
+            return Boolean(afterStart && beforeBoundary);
         });
     }
 
-    function findLegacyTocContainer() {
-        const selectors = [
+    function findTocLinks() {
+        for (const sel of [
             '.compendium-toc-full-text',
             '.compendium-toc',
             '[class*="table-of-contents"]',
             '[class*="TableOfContents"]',
             '[aria-label*="contents" i]'
-        ];
-
-        for (const selector of selectors) {
-            const el = document.querySelector(selector);
-            if (el) return el;
+        ]) {
+            const el = document.querySelector(sel);
+            if (el) return [...el.querySelectorAll('a[href]')];
         }
-        return null;
+        const h = [...mainEl().querySelectorAll('h1,h2,h3,h4,h5,h6')]
+            .find(x => /^contents$/i.test(x.textContent.trim()));
+        return h ? elementsAfterHeading(h) : [];
     }
 
-    function discoverPrimaryPages(bookRoot) {
-        let anchors = [];
-
-        const legacyToc = findLegacyTocContainer();
-        if (legacyToc) {
-            anchors = [...legacyToc.querySelectorAll('a[href]')];
-        } else {
-            const contentsHeading = findHeadingByText(/^contents$/i);
-            if (contentsHeading) {
-                anchors = elementsWithinHeadingRange(contentsHeading, 'a[href]');
-            }
-        }
-
-        if (!anchors.length) {
-            anchors = [...getMain().querySelectorAll('a[href]')]
-                .filter(a => isSameBookUrl(a.href, bookRoot));
-        }
+    function discoverPrimaryPages(root) {
+        let links = findTocLinks();
+        if (!links.length) links = [...mainEl().querySelectorAll('a[href]')].filter(a => isSameBook(a.href, root));
 
         const seen = new Set();
         const pages = [];
-
-        for (const anchor of anchors) {
+        for (const a of links) {
             let u;
-            try {
-                u = new URL(anchor.href, location.href);
-            } catch {
-                continue;
-            }
-
-            if (u.origin !== location.origin) continue;
-            if (!isSameBookUrl(u.href, bookRoot)) continue;
-
+            try { u = new URL(a.href, location.href); } catch { continue; }
+            if (!isSameBook(u.href, root)) continue;
             u.hash = '';
-
-            if (u.pathname.replace(/\/+$/, '') === bookRoot.replace(/\/+$/, '')) continue;
-
-            const key = u.href;
-            if (seen.has(key)) continue;
-            seen.add(key);
-
-            const label = anchor.textContent.trim() ||
-                decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || 'Section');
-
-            pages.push({
-                url: key,
-                label,
-                id: `ddb-page-${pages.length + 1}-${slugify(label)}`
-            });
+            if (u.pathname.replace(/\/+$/, '') === root.replace(/\/+$/, '')) continue;
+            if (seen.has(u.href)) continue;
+            seen.add(u.href);
+            const label = a.textContent.trim() || decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || 'Section');
+            pages.push({ url: u.href, label, id: `ddb-page-${pages.length + 1}-${slugify(label)}` });
         }
-
         return pages;
     }
 
-    const INDEX_HEADING_RE =
-        /\b(index|stat blocks?|spell descriptions?|creature stat blocks?|monster entries?|magic items?|feats?|background descriptions?|species descriptions?|rules glossary|glossary|reference)\b/i;
+    const INDEX_HEADING_RE = /\b(index|stat blocks?|spell descriptions?|creature stat blocks?|monster entries?|magic items?|feats?|background descriptions?|species descriptions?|rules glossary|glossary|reference)\b/i;
+    const REFERENCE_PATHS = ['/monsters/', '/spells/', '/magic-items/', '/feats/', '/backgrounds/', '/species/', '/equipment/', '/vehicles/'];
 
-    const ALLOWED_REFERENCE_PATHS = [
-        '/monsters/',
-        '/spells/',
-        '/magic-items/',
-        '/feats/',
-        '/backgrounds/',
-        '/species/',
-        '/equipment/',
-        '/vehicles/'
-    ];
-
-    function looksLikeReferenceEntityUrl(u) {
-        if (u.origin !== location.origin) return false;
-        return ALLOWED_REFERENCE_PATHS.some(prefix => u.pathname.startsWith(prefix));
-    }
-
-    function discoverIndexGroups(bookRoot) {
-        const main = getMain();
-        const candidateHeadings = [...main.querySelectorAll('h1,h2,h3,h4,h5,h6')]
+    function discoverIndexGroups(root) {
+        const groups = [];
+        const seen = new Set();
+        const headings = [...mainEl().querySelectorAll('h1,h2,h3,h4,h5,h6')]
             .filter(h => INDEX_HEADING_RE.test(h.textContent.trim()));
 
-        const groups = [];
-        const globallySeen = new Set();
-
-        for (const heading of candidateHeadings) {
-            const anchors = elementsWithinHeadingRange(heading, 'a[href]');
+        for (const h of headings) {
             const entries = [];
-
-            for (const anchor of anchors) {
-                if (!isVisibleText(anchor)) continue;
-
-                let u;
-                try {
-                    u = new URL(anchor.href, location.href);
-                } catch {
-                    continue;
-                }
-
-                const sameBookFragment = isSameBookUrl(u.href, bookRoot) && Boolean(u.hash);
-                const externalReference = looksLikeReferenceEntityUrl(u);
-
-                if (!sameBookFragment && !externalReference) continue;
-
-                const label = anchor.textContent.trim();
+            for (const a of elementsAfterHeading(h)) {
+                const label = a.textContent.trim();
                 if (!label) continue;
+                let u;
+                try { u = new URL(a.href, location.href); } catch { continue; }
+                const sameBookFragment = isSameBook(u.href, root) && Boolean(u.hash);
+                const referencePage = u.origin === location.origin && REFERENCE_PATHS.some(p => u.pathname.startsWith(p));
+                if (!sameBookFragment && !referencePage) continue;
 
-                const exact = normalizeComparableUrl(u.href);
-                if (globallySeen.has(exact)) continue;
-                globallySeen.add(exact);
-
-                entries.push({
-                    label,
-                    url: exact,
-                    fetchUrl: urlWithoutHash(exact),
-                    fragment: u.hash || '',
-                    outputId: `ddb-entry-${slugify(label)}-${globallySeen.size}`
-                });
-
-                if (globallySeen.size >= CONFIG.maxIndexedEntries) break;
+                const exact = comparableUrl(u.href);
+                if (seen.has(exact)) continue;
+                seen.add(exact);
+                entries.push({ label, url: exact, fetchUrl: withoutHash(exact), fragment: u.hash || '' });
+                if (seen.size >= CONFIG.maxIndexedLinks) break;
             }
-
-            if (entries.length) groups.push({ title: heading.textContent.trim(), entries });
-            if (globallySeen.size >= CONFIG.maxIndexedEntries) break;
+            if (entries.length) groups.push({ title: h.textContent.trim(), entries });
+            if (seen.size >= CONFIG.maxIndexedLinks) break;
         }
-
         return groups;
     }
 
-    function flattenIndexEntries(groups) {
-        return groups.flatMap(group => group.entries);
+    const flattenEntries = groups => groups.flatMap(g => g.entries);
+
+    function buildReferenceDocuments(entries, primaryPages) {
+        const primary = new Set(primaryPages.map(p => withoutHash(p.url)));
+        const byUrl = new Map();
+        for (const entry of entries) {
+            if (primary.has(entry.fetchUrl)) continue;
+            if (!byUrl.has(entry.fetchUrl)) {
+                byUrl.set(entry.fetchUrl, {
+                    url: entry.fetchUrl,
+                    label: entry.label,
+                    id: `ddb-ref-${byUrl.size + 1}-${slugify(entry.label)}`,
+                    entries: []
+                });
+            }
+            byUrl.get(entry.fetchUrl).entries.push(entry);
+        }
+        return [...byUrl.values()];
     }
 
     async function fetchWithTimeout(url) {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), CONFIG.requestTimeoutMs);
-
+        const c = new AbortController();
+        const timer = setTimeout(() => c.abort(), CONFIG.requestTimeoutMs);
         try {
             return await fetch(url, {
-                method: 'GET',
                 credentials: 'include',
                 redirect: 'follow',
-                signal: controller.signal,
+                signal: c.signal,
                 headers: { Accept: 'text/html,application/xhtml+xml' }
             });
-        } finally {
-            clearTimeout(timer);
-        }
+        } finally { clearTimeout(timer); }
     }
 
-    async function fetchDocumentHtml(url) {
-        const fetchUrl = urlWithoutHash(url);
-        if (state.fetchCache.has(fetchUrl)) return state.fetchCache.get(fetchUrl);
+    async function fetchHtml(url) {
+        const key = withoutHash(url);
+        if (state.fetchCache.has(key)) return state.fetchCache.get(key);
 
         const promise = (async () => {
-            let lastError = null;
-
+            let last;
             for (let attempt = 1; attempt <= CONFIG.maxRetries; attempt++) {
                 if (state.cancelled) throw new Error('Cancelled');
-
                 try {
-                    const response = await fetchWithTimeout(fetchUrl);
-
-                    if (
-                        response.url.includes('/login') ||
-                        response.url.includes('/sign-in') ||
-                        response.url.includes('marketplace.dndbeyond.com')
-                    ) {
-                        throw new Error(
-                            'D&D Beyond redirected this request to login/Marketplace. ' +
-                            'Open the target normally first and verify your account has access.'
-                        );
+                    const r = await fetchWithTimeout(key);
+                    if (/\/login|\/sign-in|marketplace\.dndbeyond\.com/i.test(r.url)) {
+                        throw new Error('Redirected to login/Marketplace; verify this account can open the target normally.');
                     }
-
-                    if (response.ok) return await response.text();
-
-                    const retryable = [429, 500, 502, 503, 504].includes(response.status);
-                    if (!retryable) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-
-                    let delay = 1400 * attempt;
-                    const retryAfter = response.headers.get('Retry-After');
-                    if (retryAfter && Number.isFinite(Number(retryAfter))) {
-                        delay = Math.max(delay, Number(retryAfter) * 1000);
-                    }
-
-                    warn(`HTTP ${response.status}; retrying ${fetchUrl} in ${Math.round(delay)} ms`);
-                    await sleep(delay);
-                } catch (error) {
-                    lastError = error;
-                    if (attempt >= CONFIG.maxRetries) break;
-                    const delay = 1200 * attempt + Math.random() * 900;
-                    warn(`Request attempt ${attempt}/${CONFIG.maxRetries} failed`, fetchUrl, error);
-                    await sleep(delay);
+                    if (r.ok) return await r.text();
+                    if (![429, 500, 502, 503, 504].includes(r.status)) throw new Error(`HTTP ${r.status} ${r.statusText}`);
+                    let wait = 1400 * attempt;
+                    const retryAfter = Number(r.headers.get('Retry-After'));
+                    if (Number.isFinite(retryAfter) && retryAfter > 0) wait = Math.max(wait, retryAfter * 1000);
+                    await sleep(wait);
+                } catch (e) {
+                    last = e;
+                    if (attempt === CONFIG.maxRetries) break;
+                    await sleep(1200 * attempt + Math.random() * 900);
                 }
             }
-
-            throw lastError || new Error(`Failed to fetch ${fetchUrl}`);
+            throw last || new Error(`Failed to fetch ${key}`);
         })();
 
-        state.fetchCache.set(fetchUrl, promise);
-
-        try {
-            return await promise;
-        } catch (error) {
-            state.fetchCache.delete(fetchUrl);
-            throw error;
-        }
+        state.fetchCache.set(key, promise);
+        try { return await promise; }
+        catch (e) { state.fetchCache.delete(key); throw e; }
     }
 
-    const ARTICLE_SELECTORS = [
-        '.p-article-content',
-        '.compendium-content',
-        '.ddb-compendium-page',
-        '[class*="compendium"][class*="content"]',
-        'main article',
-        'article',
-        'main'
-    ];
+    function parse(html) { return new DOMParser().parseFromString(html, 'text/html'); }
 
-    function findArticleContent(doc) {
-        for (const selector of ARTICLE_SELECTORS) {
-            const el = doc.querySelector(selector);
+    function findArticle(doc) {
+        for (const sel of [
+            '.p-article-content', '.compendium-content', '.ddb-compendium-page',
+            '[class*="compendium"][class*="content"]', 'main article', 'article', 'main'
+        ]) {
+            const el = doc.querySelector(sel);
             if (el) return el;
         }
         return null;
     }
 
-    function prepareImageElement(img, sourceUrl) {
-        const lazyCandidates = [
-            img.getAttribute('data-src'),
-            img.getAttribute('data-original'),
-            img.getAttribute('data-lazy-src'),
-            img.getAttribute('data-url')
-        ].filter(Boolean);
+    function normalizeAssets(root, sourceUrl) {
+        root.querySelectorAll('img').forEach(img => {
+            const lazy = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-lazy-src');
+            let src = img.getAttribute('src') || '';
+            if (lazy && (!src || /^data:image\/gif/i.test(src) || /placeholder/i.test(src))) img.setAttribute('src', lazy);
+            if (img.getAttribute('src')) img.setAttribute('src', absoluteUrl(img.getAttribute('src'), sourceUrl));
+            const srcset = img.getAttribute('srcset');
+            if (srcset && !srcset.startsWith('data:')) {
+                img.setAttribute('srcset', srcset.split(',').map(x => {
+                    const p = x.trim().split(/\s+/); p[0] = absoluteUrl(p[0], sourceUrl); return p.join(' ');
+                }).join(', '));
+            }
+            img.loading = 'eager';
+            img.decoding = 'sync';
+        });
 
-        let src = img.getAttribute('src') || '';
-
-        if (
-            lazyCandidates.length &&
-            (!src || src.startsWith('data:image/gif') || /placeholder/i.test(src))
-        ) {
-            src = lazyCandidates[0];
-            img.setAttribute('src', src);
-        }
-
-        if (img.getAttribute('src')) {
-            img.setAttribute('src', absoluteUrl(img.getAttribute('src'), sourceUrl));
-        }
-
-        const srcset = img.getAttribute('srcset');
-        if (srcset && !srcset.startsWith('data:')) {
-            const converted = srcset
-                .split(',')
-                .map(candidate => {
-                    const pieces = candidate.trim().split(/\s+/);
-                    pieces[0] = absoluteUrl(pieces[0], sourceUrl);
-                    return pieces.join(' ');
-                })
-                .join(', ');
-            img.setAttribute('srcset', converted);
-        }
-
-        img.loading = 'eager';
-        img.decoding = 'sync';
+        root.querySelectorAll('a[href]').forEach(a => {
+            const href = a.getAttribute('href');
+            if (href && !href.startsWith('#')) a.setAttribute('href', absoluteUrl(href, sourceUrl));
+        });
     }
 
     function cleanupContent(content, sourceUrl) {
         const clone = content.cloneNode(true);
-
-        clone.querySelectorAll([
-            'script', 'style', 'nav', 'footer', 'button', 'iframe', 'noscript',
-            '[role="navigation"]', '[role="banner"]',
-            '[class*="advertisement"]', '[class*="ad-container"]'
-        ].join(',')).forEach(el => el.remove());
-
-        clone.querySelectorAll('img').forEach(img => prepareImageElement(img, sourceUrl));
-
-        clone.querySelectorAll('source').forEach(source => {
-            const src = source.getAttribute('src');
-            if (src) source.setAttribute('src', absoluteUrl(src, sourceUrl));
-
-            const srcset = source.getAttribute('srcset');
-            if (srcset && !srcset.startsWith('data:')) {
-                source.setAttribute(
-                    'srcset',
-                    srcset.split(',').map(candidate => {
-                        const pieces = candidate.trim().split(/\s+/);
-                        pieces[0] = absoluteUrl(pieces[0], sourceUrl);
-                        return pieces.join(' ');
-                    }).join(', ')
-                );
-            }
-        });
-
-        clone.querySelectorAll('a[href]').forEach(anchor => {
-            const href = anchor.getAttribute('href');
-            if (!href || href.startsWith('#')) return;
-            anchor.setAttribute('href', absoluteUrl(href, sourceUrl));
-        });
-
-        clone.querySelectorAll('[style]').forEach(el => {
-            const style = el.getAttribute('style');
-            if (!style || !style.includes('url(')) return;
-
-            el.setAttribute(
-                'style',
-                style.replace(/url\((['"]?)(.*?)\1\)/gi, (match, quote, assetUrl) => {
-                    if (/^(data:|blob:)/i.test(assetUrl)) return match;
-                    return `url("${absoluteUrl(assetUrl, sourceUrl)}")`;
-                })
-            );
-        });
-
+        clone.querySelectorAll('script,style,nav,footer,button,iframe,noscript,[role="navigation"],[role="banner"],[class*="advertisement"],[class*="ad-container"]')
+            .forEach(el => el.remove());
+        normalizeAssets(clone, sourceUrl);
         return clone;
     }
 
-    function parseHtml(html) {
-        return new DOMParser().parseFromString(html, 'text/html');
+    function looksLikeArtistCredit(el) {
+        if (!el || !['P', 'DIV', 'SPAN', 'FIGCAPTION'].includes(el.tagName)) return false;
+        const t = el.textContent?.replace(/\s+/g, ' ').trim() || '';
+        if (!t || t.length > 80 || t.split(/\s+/).length > 7 || /[.!?;:]/.test(t)) return false;
+        if (/\b(AC|HP|CR|Speed|Action|Trait|Habitat|Treasure|Language|Immunity|Resistance)\b/i.test(t)) return false;
+        return /[A-Za-z]/.test(t);
     }
 
-    function extractPrimaryPage(html, sourceUrl, fallbackTitle) {
-        const doc = parseHtml(html);
-        const content = findArticleContent(doc);
-        if (!content) throw new Error('Could not locate sourcebook article content on this page.');
-
-        const title =
-            content.querySelector('h1')?.textContent?.trim() ||
-            doc.querySelector('main h1')?.textContent?.trim() ||
-            fallbackTitle || sourceUrl;
-
-        return { title, node: cleanupContent(content, sourceUrl) };
+    function groupArtwork(root) {
+        const done = new Set();
+        for (const img of [...root.querySelectorAll('img')]) {
+            let art = img.closest('figure') || img.closest('picture') || img;
+            if (done.has(art) || art.closest('.ddb-art-block')) continue;
+            done.add(art);
+            const prev = art.previousElementSibling;
+            if (!looksLikeArtistCredit(prev)) continue;
+            const wrap = root.ownerDocument.createElement('div');
+            wrap.className = 'ddb-art-block';
+            art.parentNode.insertBefore(wrap, prev);
+            wrap.append(prev, art);
+        }
     }
 
-    function findFragmentTarget(doc, hash) {
-        if (!hash) return null;
+    function namespaceAnchors(root, prefix) {
+        const map = new Map();
+        root.querySelectorAll('[id]').forEach(el => {
+            const old = el.id;
+            if (!old) return;
+            const next = `${prefix}--${old}`;
+            map.set(`#${old}`, `#${next}`);
+            try { map.set(`#${decodeURIComponent(old)}`, `#${next}`); } catch {}
+            el.id = next;
+        });
+        root.querySelectorAll('a[name]').forEach(el => {
+            const old = el.getAttribute('name');
+            if (!old) return;
+            const next = `${prefix}--${old}`;
+            map.set(`#${old}`, `#${next}`);
+            el.setAttribute('name', next);
+            if (!el.id) el.id = next;
+        });
+        root.querySelectorAll('a[href^="#"]').forEach(a => {
+            const h = a.getAttribute('href');
+            if (map.has(h)) a.setAttribute('href', map.get(h));
+        });
+        return map;
+    }
 
-        let id;
+    function extractDocument(html, sourceUrl, fallbackTitle, namespace) {
+        const doc = parse(html);
+        const article = findArticle(doc);
+        if (!article) throw new Error('Could not locate sourcebook article content.');
+        const node = cleanupContent(article, sourceUrl);
+        groupArtwork(node);
+        const anchorMap = namespaceAnchors(node, namespace);
+        return {
+            title: article.querySelector('h1')?.textContent?.trim() || doc.querySelector('main h1')?.textContent?.trim() || fallbackTitle,
+            node,
+            anchorMap
+        };
+    }
+
+    function resolveFragment(result, hash) {
+        if (!result?.anchorMap || !hash) return null;
+        if (result.anchorMap.has(hash)) return result.anchorMap.get(hash);
         try {
-            id = decodeURIComponent(hash.replace(/^#/, ''));
-        } catch {
-            id = hash.replace(/^#/, '');
-        }
-
-        if (!id) return null;
-
-        return (
-            doc.getElementById(id) ||
-            doc.querySelector(`[name="${CSS.escape(id)}"]`) ||
-            [...doc.querySelectorAll('[id]')].find(el => el.id.toLowerCase() === id.toLowerCase()) ||
-            null
-        );
+            const d = `#${decodeURIComponent(hash.replace(/^#/, ''))}`;
+            return result.anchorMap.get(d) || null;
+        } catch { return null; }
     }
 
-    function nearestUsefulWrapper(target) {
-        if (!target) return null;
+    function buildMaps(primaryPages, primaryResults, refs, refResults, entries) {
+        const documentMap = new Map();
+        const resultMap = new Map();
+        const targetMap = new Map();
 
-        const preferred = target.closest([
-            '.mon-stat-block',
-            '.monster-stat-block',
-            '[class*="stat-block"]',
-            '[class*="spell-block"]',
-            '[class*="item-block"]',
-            'article',
-            'section'
-        ].join(','));
+        primaryPages.forEach((p, i) => {
+            const base = withoutHash(p.url);
+            documentMap.set(base, `#${p.id}`);
+            resultMap.set(base, primaryResults[i]);
+        });
+        refs.forEach((d, i) => {
+            const base = withoutHash(d.url);
+            documentMap.set(base, `#${d.id}`);
+            resultMap.set(base, refResults[i]);
+        });
 
-        if (preferred && !['ARTICLE', 'MAIN'].includes(preferred.tagName)) return preferred;
-        return null;
+        for (const e of entries) {
+            const exact = comparableUrl(e.url);
+            const owner = resultMap.get(e.fetchUrl);
+            const fragmentTarget = e.fragment ? resolveFragment(owner, e.fragment) : null;
+            targetMap.set(exact, fragmentTarget || documentMap.get(e.fetchUrl) || e.url);
+        }
+        return { documentMap, targetMap };
     }
 
-    function extractHeadingRangeFromTarget(doc, target) {
-        if (!target) return null;
-
-        let heading = null;
-        if (/^H[1-6]$/i.test(target.tagName)) {
-            heading = target;
-        } else {
-            heading = target.closest('h1,h2,h3,h4,h5,h6');
-        }
-
-        if (!heading) {
-            let cursor = target;
-            for (let i = 0; i < 6 && cursor; i++) {
-                cursor = cursor.nextElementSibling;
-                if (cursor && /^H[1-6]$/i.test(cursor.tagName)) {
-                    heading = cursor;
-                    break;
-                }
-            }
-        }
-
-        if (!heading) return null;
-
-        const level = headingLevel(heading);
-        const wrapper = doc.createElement('div');
-        let node = heading;
-
-        while (node) {
-            if (
-                node !== heading &&
-                /^H[1-6]$/i.test(node.tagName) &&
-                headingLevel(node) <= level
-            ) break;
-
-            wrapper.appendChild(node.cloneNode(true));
-            node = node.nextElementSibling;
-        }
-
-        return wrapper.children.length ? wrapper : null;
-    }
-
-    function findEntityBlock(doc, label) {
-        const selectors = [
-            '.mon-stat-block',
-            '.monster-stat-block',
-            '[class*="mon-stat-block"]',
-            '[class*="monster-stat-block"]',
-            '[class*="stat-block"]',
-            '[data-testid*="stat-block"]',
-            '[class*="spell-block"]',
-            '[class*="item-block"]'
-        ];
-
-        for (const selector of selectors) {
-            const blocks = [...doc.querySelectorAll(selector)];
-            if (!blocks.length) continue;
-            if (blocks.length === 1) return blocks[0];
-
-            const normalizedLabel = label.trim().toLowerCase();
-            const exact = blocks.find(block =>
-                block.querySelector('h1,h2,h3,h4,h5,h6')?.textContent?.trim().toLowerCase() === normalizedLabel
-            );
-            if (exact) return exact;
-        }
-
-        return null;
-    }
-
-    function findHeadingByLabel(doc, label) {
-        const needle = label.trim().toLowerCase();
-        return [...doc.querySelectorAll('h1,h2,h3,h4,h5,h6')]
-            .find(h => h.textContent.trim().toLowerCase() === needle);
-    }
-
-    function extractIndexedEntry(html, entry) {
-        const doc = parseHtml(html);
-
-        if (entry.fragment) {
-            const target = findFragmentTarget(doc, entry.fragment);
-            if (target) {
-                const wrapper = nearestUsefulWrapper(target);
-                if (wrapper) return cleanupContent(wrapper, entry.url);
-
-                const range = extractHeadingRangeFromTarget(doc, target);
-                if (range) return cleanupContent(range, entry.url);
-            }
-        }
-
-        const entity = findEntityBlock(doc, entry.label);
-        if (entity) return cleanupContent(entity, entry.url);
-
-        const heading = findHeadingByLabel(doc, entry.label);
-        if (heading) {
-            const range = extractHeadingRangeFromTarget(doc, heading);
-            if (range) return cleanupContent(range, entry.url);
-        }
-
-        if (!entry.fragment) {
-            const article = findArticleContent(doc);
-            if (article) return cleanupContent(article, entry.url);
-        }
-
-        throw new Error(`Could not isolate indexed entry "${entry.label}"`);
-    }
-
-    function buildPageMaps(primaryPages, indexEntries) {
-        const pageMap = new Map();
-        const exactEntryMap = new Map();
-
-        for (const page of primaryPages) {
-            pageMap.set(urlWithoutHash(page.url), `#${page.id}`);
-        }
-
-        for (const entry of indexEntries) {
-            exactEntryMap.set(normalizeComparableUrl(entry.url), `#${entry.outputId}`);
-        }
-
-        return { pageMap, exactEntryMap };
-    }
-
-    function rewriteLinks(root, sourceUrl, pageMap, exactEntryMap, entriesIncludedByPage) {
-        root.querySelectorAll('a[href]').forEach(anchor => {
-            const href = anchor.getAttribute('href');
-            if (!href || /^(mailto:|javascript:)/i.test(href)) return;
-
+    function rewriteLinks(root, sourceUrl, documentMap, targetMap) {
+        root.querySelectorAll('a[href]').forEach(a => {
+            const href = a.getAttribute('href');
+            if (!href || href.startsWith('#') || /^(mailto:|javascript:)/i.test(href)) return;
             let u;
-            try {
-                u = new URL(href, sourceUrl);
-            } catch {
-                return;
-            }
-
-            const exact = normalizeComparableUrl(u.href);
-
-            if (exactEntryMap.has(exact) && !entriesIncludedByPage.has(exact)) {
-                anchor.setAttribute('href', exactEntryMap.get(exact));
-                return;
-            }
-
-            const base = urlWithoutHash(u.href);
-
-            if (u.hash && pageMap.has(base)) {
-                anchor.setAttribute('href', u.hash);
-                return;
-            }
-
-            if (!u.hash && pageMap.has(base)) {
-                anchor.setAttribute('href', pageMap.get(base));
-            }
+            try { u = new URL(href, sourceUrl); } catch { return; }
+            const exact = comparableUrl(u.href);
+            if (targetMap.has(exact)) a.setAttribute('href', targetMap.get(exact));
+            else if (documentMap.has(withoutHash(u.href))) a.setAttribute('href', documentMap.get(withoutHash(u.href)));
         });
     }
 
-    function currentStylesheetLinks() {
+    function stylesheetLinks() {
         if (!CONFIG.includeSiteCss) return '';
-
-        const hrefs = new Set();
-        document.querySelectorAll('link[rel="stylesheet"][href]').forEach(link => {
-            try {
-                hrefs.add(new URL(link.href, location.href).href);
-            } catch {
-                // ignore
-            }
-        });
-
-        return [...hrefs]
-            .map(href => `<link rel="stylesheet" href="${escapeHtml(href)}">`)
-            .join('\n');
-    }
-
-    function printCss() {
-        return `
-<style>
-    :root { color-scheme: light; }
-    *, *::before, *::after { box-sizing: border-box; }
-    html, body { background: #fff !important; }
-
-    body {
-        margin: 0 auto;
-        max-width: 8in;
-        padding: 0.3in;
-        color: #111 !important;
-        font-size: 10.5pt;
-        line-height: 1.36;
-        overflow: visible !important;
-    }
-
-    .ddb-pdf-toolbar {
-        position: sticky;
-        top: 0;
-        z-index: 2147483647;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        align-items: center;
-        margin: -0.3in -0.3in 18px;
-        padding: 10px 12px;
-        background: #222;
-        color: #fff;
-        font-family: Arial, sans-serif;
-        box-shadow: 0 2px 10px rgba(0,0,0,.25);
-    }
-
-    .ddb-pdf-toolbar button {
-        padding: 8px 12px;
-        cursor: pointer;
-        font-weight: 700;
-    }
-
-    .ddb-pdf-toolbar .ddb-status {
-        margin-left: auto;
-        font-size: 9pt;
-    }
-
-    .ddb-cover {
-        min-height: 8.7in;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        align-items: center;
-        text-align: center;
-        break-after: page;
-        page-break-after: always;
-    }
-
-    .ddb-cover h1 {
-        font-size: 30pt;
-        line-height: 1.08;
-        margin: 0 0 20pt;
-    }
-
-    .ddb-cover .ddb-source {
-        margin-top: 20pt;
-        max-width: 90%;
-        font: 8.5pt/1.35 Arial, sans-serif;
-        opacity: .65;
-        overflow-wrap: anywhere;
-    }
-
-    .ddb-generated-toc {
-        break-after: page;
-        page-break-after: always;
-    }
-
-    .ddb-generated-toc ol,
-    .ddb-generated-index ul { padding-left: 1.35rem; }
-
-    .ddb-generated-toc li,
-    .ddb-generated-index li { margin: .16rem 0; }
-
-    .ddb-generated-toc a,
-    .ddb-generated-index a {
-        color: inherit !important;
-        text-decoration: none !important;
-    }
-
-    .ddb-major-page {
-        clear: both;
-        width: 100%;
-        break-inside: auto;
-        page-break-inside: auto;
-        ${CONFIG.majorPagesStartNewPage ? 'break-before: page; page-break-before: always;' : ''}
-    }
-
-    .ddb-indexed-material {
-        clear: both;
-        break-before: page;
-        page-break-before: always;
-    }
-
-    .ddb-index-entry {
-        clear: both;
-        break-before: auto;
-        page-break-before: auto;
-        break-inside: auto;
-        page-break-inside: auto;
-        margin-top: 1.2em;
-    }
-
-    .ddb-index-entry + .ddb-index-entry { margin-top: 1.6em; }
-    .ddb-entry-title { margin-top: 1.2em; }
-
-    p { orphans: 3; widows: 3; }
-
-    h1, h2, h3, h4, h5, h6 {
-        break-after: avoid-page;
-        page-break-after: avoid;
-        orphans: 3;
-        widows: 3;
-    }
-
-    h1 + *, h2 + *, h3 + *, h4 + *, h5 + *, h6 + * {
-        break-before: avoid-page;
-        page-break-before: avoid;
-    }
-
-    ul, ol { break-inside: auto; page-break-inside: auto; }
-    li { break-inside: avoid-page; page-break-inside: avoid; }
-    blockquote, aside { break-inside: auto; page-break-inside: auto; }
-
-    blockquote > p,
-    aside > p { break-inside: avoid-page; page-break-inside: avoid; }
-
-    figure {
-        max-width: 100% !important;
-        break-inside: avoid-page;
-        page-break-inside: avoid;
-        margin-left: auto;
-        margin-right: auto;
-    }
-
-    img, picture, svg, canvas {
-        max-width: 100% !important;
-        height: auto !important;
-    }
-
-    figcaption {
-        text-align: center;
-        break-before: avoid-page;
-        page-break-before: avoid;
-    }
-
-    table {
-        width: 100%;
-        max-width: 100%;
-        border-collapse: collapse;
-        break-inside: auto;
-        page-break-inside: auto;
-    }
-
-    thead { display: table-header-group; }
-    tfoot { display: table-footer-group; }
-    tr, th, td { break-inside: avoid-page; page-break-inside: avoid; }
-
-    pre, code {
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-    }
-
-    .mon-stat-block,
-    .monster-stat-block,
-    [class*="mon-stat-block"],
-    [class*="monster-stat-block"],
-    [class*="stat-block"] {
-        break-inside: auto !important;
-        page-break-inside: auto !important;
-    }
-
-    .mon-stat-block p,
-    .monster-stat-block p,
-    [class*="stat-block"] p,
-    .mon-stat-block li,
-    .monster-stat-block li,
-    [class*="stat-block"] li {
-        break-inside: avoid-page;
-        page-break-inside: avoid;
-    }
-
-    .compendium-image-left,
-    .monster-image-left {
-        float: left;
-        margin: .25rem 1rem .5rem 0;
-    }
-
-    .compendium-image-right,
-    .monster-image-right {
-        float: right;
-        margin: .25rem 0 .5rem 1rem;
-    }
-
-    .compendium-center-banner-img { width: 100% !important; }
-
-    .ddb-error {
-        margin: 1rem 0;
-        padding: .75rem;
-        border: 1px solid #999;
-        font-family: Arial, sans-serif;
-        break-inside: avoid-page;
-    }
-
-    .ddb-report {
-        break-before: page;
-        page-break-before: always;
-        font-family: Arial, sans-serif;
-        font-size: 9pt;
-    }
-
-    .ddb-report table { width: auto; }
-
-    @page {
-        size: Letter;
-        margin: 0.62in 0.58in 0.68in;
-    }
-
-    @media print {
-        html, body {
-            max-width: none !important;
-            width: auto !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            background: #fff !important;
-            -webkit-print-color-adjust: exact !important;
-            print-color-adjust: exact !important;
-            overflow: visible !important;
-        }
-
-        .ddb-pdf-toolbar { display: none !important; }
-
-        a {
-            color: inherit !important;
-            text-decoration: none !important;
-        }
-    }
-</style>`;
+        const urls = new Set();
+        document.querySelectorAll('link[rel="stylesheet"][href]').forEach(l => urls.add(absoluteUrl(l.href)));
+        return [...urls].map(u => `<link rel="stylesheet" href="${escapeHtml(u)}">`).join('\n');
     }
 
     function findCoverArt() {
-        const link = [...document.querySelectorAll('a[href]')]
-            .find(a => /view cover art/i.test(a.textContent.trim()));
-        return link?.href || '';
+        return [...document.querySelectorAll('a[href]')].find(a => /view cover art/i.test(a.textContent.trim()))?.href || '';
     }
 
-    function buildGeneratedIndex(groups, includedEntries) {
-        if (!groups.length) return '';
-
-        const includedSet = new Set(includedEntries.map(e => normalizeComparableUrl(e.url)));
-
-        return groups.map(group => {
-            const items = group.entries.map(entry => {
-                let href;
-                if (includedSet.has(normalizeComparableUrl(entry.url))) {
-                    href = `#${entry.outputId}`;
-                } else if (entry.fragment) {
-                    href = entry.fragment;
-                } else {
-                    href = entry.url;
-                }
-
-                return `<li><a href="${escapeHtml(href)}">${escapeHtml(entry.label)}</a></li>`;
-            }).join('');
-
-            return `
-<section class="ddb-generated-index">
-    <h2>${escapeHtml(group.title)}</h2>
-    <ul>${items}</ul>
-</section>`;
-        }).join('\n');
+    function css() {
+        return `<style>
+:root{color-scheme:light}*,*::before,*::after{box-sizing:border-box}html,body{background:#fff!important}
+body{margin:0 auto;max-width:8in;padding:.28in;color:#111!important;font-size:10.5pt;line-height:1.36;overflow:visible!important}
+.ddb-pdf-toolbar{position:sticky;top:0;z-index:2147483647;display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:-.28in -.28in 18px;padding:10px 12px;background:#222;color:#fff;font-family:Arial,sans-serif;box-shadow:0 2px 10px #0004}
+.ddb-pdf-toolbar button{padding:8px 12px;cursor:pointer;font-weight:700}.ddb-status{margin-left:auto;font-size:9pt}
+.ddb-cover{text-align:center;break-after:page!important;page-break-after:always!important}.ddb-cover h1{font-size:30pt;line-height:1.08;margin:0 0 16pt;break-after:avoid-page!important}
+.ddb-cover img{display:block!important;width:auto!important;max-width:100%!important;max-height:7in!important;height:auto!important;object-fit:contain!important;margin:0 auto!important}
+.ddb-source{margin:12pt auto 0;max-width:90%;font:8pt/1.3 Arial,sans-serif;opacity:.62;overflow-wrap:anywhere}
+.ddb-generated-toc{break-after:page!important;page-break-after:always!important}.ddb-generated-toc ol,.ddb-generated-index ul{padding-left:1.35rem}.ddb-generated-toc li,.ddb-generated-index li{margin:.14rem 0}.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}
+.ddb-content-root,.ddb-major-page,.ddb-reference-document{width:100%;clear:both}
+.ddb-content-root *,.ddb-content-root *::before,.ddb-content-root *::after{break-before:auto!important;break-after:auto!important;page-break-before:auto!important;page-break-after:auto!important;break-inside:auto!important;page-break-inside:auto!important}
+.ddb-major-page{${CONFIG.majorPagesStartNewPage ? 'break-before:page!important;page-break-before:always!important;' : ''}}.ddb-reference-document+.ddb-reference-document{margin-top:1.25em}
+p{orphans:3;widows:3}h1,h2,h3,h4,h5,h6{break-after:avoid-page!important;page-break-after:avoid!important;orphans:3;widows:3}h1+*,h2+*,h3+*,h4+*,h5+*,h6+*{break-before:avoid-page!important;page-break-before:avoid!important}
+ul,ol,li,blockquote,aside{break-inside:auto!important;page-break-inside:auto!important}
+table{width:100%;max-width:100%;border-collapse:collapse;break-inside:auto!important}thead{display:table-header-group}tfoot{display:table-footer-group}tr{break-inside:avoid-page!important;page-break-inside:avoid!important}th,td{vertical-align:top}
+figure,picture{max-width:100%!important;break-inside:auto!important;page-break-inside:auto!important;margin-left:auto;margin-right:auto}img,picture,svg,canvas{max-width:100%!important;height:auto!important}.ddb-content-root img{max-height:7.25in!important;object-fit:contain!important}
+.ddb-art-block{clear:both;break-inside:avoid-page!important;page-break-inside:avoid!important;margin:.35em 0 .75em}.ddb-art-block>:first-child{break-after:avoid-page!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:7.05in!important;margin:.15em auto 0!important}figcaption{text-align:center;break-before:avoid-page!important}
+.mon-stat-block,.monster-stat-block,[class*="mon-stat-block"],[class*="monster-stat-block"],[class*="stat-block"]{break-inside:auto!important;page-break-inside:auto!important}.mon-stat-block p,.monster-stat-block p,[class*="stat-block"] p,.mon-stat-block li,.monster-stat-block li,[class*="stat-block"] li{break-inside:avoid-page!important;page-break-inside:avoid!important}
+.compendium-image-left,.monster-image-left{float:left;margin:.25rem 1rem .5rem 0}.compendium-image-right,.monster-image-right{float:right;margin:.25rem 0 .5rem 1rem}.compendium-center-banner-img{width:100%!important}
+.ddb-error{margin:1rem 0;padding:.75rem;border:1px solid #999;font-family:Arial,sans-serif;break-inside:avoid-page!important}.ddb-report{break-before:page!important;page-break-before:always!important;font:9pt Arial,sans-serif}.ddb-report table{width:auto}
+@page{size:Letter;margin:.62in .58in .68in}
+@media print{html,body{max-width:none!important;width:auto!important;margin:0!important;padding:0!important;background:#fff!important;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important;overflow:visible!important}.ddb-pdf-toolbar{display:none!important}a{color:inherit!important;text-decoration:none!important}${CONFIG.includeCaptureReportInPrint ? '' : '.ddb-report{display:none!important}'}}
+</style>`;
     }
 
-    function buildFinalDocument({
-        bookTitle,
-        bookRoot,
-        primaryPages,
-        primaryResults,
-        indexGroups,
-        includedEntries,
-        entryResults,
-        entriesIncludedByPage,
-        pageMap,
-        exactEntryMap
-    }) {
-        for (const result of primaryResults) {
-            if (!result?.node) continue;
-            rewriteLinks(result.node, result.sourceUrl, pageMap, exactEntryMap, entriesIncludedByPage);
-        }
+    function buildIndex(groups, targetMap) {
+        return groups.map(g => `<section class="ddb-generated-index"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href="${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`).join('');
+    }
 
-        for (const result of entryResults) {
-            if (!result?.node) continue;
-            rewriteLinks(result.node, result.sourceUrl, pageMap, exactEntryMap, entriesIncludedByPage);
-        }
+    function trailingPrimary(page) { return /^(appendix\b|credits?\b|acknowledg|legal\b|index\b)/i.test(page.label.trim()); }
 
-        const tocItems = primaryPages.map((page, i) => {
-            const title = primaryResults[i]?.title || page.label;
-            return `<li><a href="#${escapeHtml(page.id)}">${escapeHtml(title)}</a></li>`;
-        }).join('');
+    function renderPrimary(page, result) {
+        if (!result?.node) return `<section id="${escapeHtml(page.id)}" class="ddb-major-page"><div class="ddb-error"><h1>${escapeHtml(page.label)}</h1><p>${escapeHtml(result?.error || 'Capture failed')}</p></div></section>`;
+        return `<section id="${escapeHtml(page.id)}" class="ddb-major-page" data-source-url="${escapeHtml(page.url)}">${result.node.innerHTML}</section>`;
+    }
 
-        const primaryHtml = primaryPages.map((page, i) => {
-            const result = primaryResults[i];
+    function renderRef(doc, result) {
+        if (!result?.node) return `<section id="${escapeHtml(doc.id)}" class="ddb-reference-document"><div class="ddb-error"><h2>${escapeHtml(doc.label)}</h2><p>${escapeHtml(result?.error || 'Capture failed')}</p></div></section>`;
+        return `<section id="${escapeHtml(doc.id)}" class="ddb-reference-document" data-source-url="${escapeHtml(doc.url)}">${result.node.innerHTML}</section>`;
+    }
 
-            if (!result?.node) {
-                return `
-<section id="${escapeHtml(page.id)}" class="ddb-major-page">
-    <div class="ddb-error">
-        <h1>${escapeHtml(page.label)}</h1>
-        <p>This sourcebook page could not be captured.</p>
-        <p>${escapeHtml(result?.error || 'Unknown error')}</p>
-        <p><a href="${escapeHtml(page.url)}">${escapeHtml(page.url)}</a></p>
-    </div>
-</section>`;
-            }
+    function buildDocument({ bookTitle, root, primaryPages, primaryResults, refs, refResults, indexGroups, documentMap, targetMap }) {
+        primaryResults.forEach(r => r?.node && rewriteLinks(r.node, r.sourceUrl, documentMap, targetMap));
+        refResults.forEach(r => r?.node && rewriteLinks(r.node, r.sourceUrl, documentMap, targetMap));
 
-            return `
-<section id="${escapeHtml(page.id)}" class="ddb-major-page" data-source-url="${escapeHtml(page.url)}">
-${result.node.innerHTML}
-</section>`;
-        }).join('\n');
-
-        const generatedIndex = buildGeneratedIndex(indexGroups, includedEntries);
-
-        const indexedHtml = includedEntries.length ? `
-<section class="ddb-indexed-material">
-    <h1>Indexed Reference Material</h1>
-    <p>
-        These entries were linked by the sourcebook but were not already contained
-        in one of the captured sourcebook pages. They are included here so the
-        generated PDF remains useful offline.
-    </p>
-</section>
-${includedEntries.map((entry, i) => {
-            const result = entryResults[i];
-
-            if (!result?.node) {
-                return `
-<section id="${escapeHtml(entry.outputId)}" class="ddb-index-entry">
-    <div class="ddb-error">
-        <h2>${escapeHtml(entry.label)}</h2>
-        <p>This indexed entry could not be isolated.</p>
-        <p>${escapeHtml(result?.error || 'Unknown error')}</p>
-        <p><a href="${escapeHtml(entry.url)}">${escapeHtml(entry.url)}</a></p>
-    </div>
-</section>`;
-            }
-
-            return `
-<section id="${escapeHtml(entry.outputId)}" class="ddb-index-entry" data-source-url="${escapeHtml(entry.url)}">
-${result.node.innerHTML}
-</section>`;
-        }).join('\n')}` : '';
-
-        const allFailures = [
-            ...primaryResults.filter(r => r?.error).map(r => ({ type: 'Page', name: r.label, error: r.error })),
-            ...entryResults.filter(r => r?.error).map(r => ({ type: 'Entry', name: r.label, error: r.error }))
-        ];
-
-        const reportRows = [
+        const lead = [], tail = [];
+        primaryPages.forEach((p, i) => (refs.length && trailingPrimary(p) ? tail : lead).push(renderPrimary(p, primaryResults[i])));
+        const refHtml = refs.map((d, i) => renderRef(d, refResults[i])).join('\n');
+        const failures = [...primaryResults, ...refResults].filter(r => r?.error);
+        const cover = findCoverArt();
+        const toc = primaryPages.map((p, i) => `<li><a href="#${p.id}">${escapeHtml(primaryResults[i]?.title || p.label)}</a></li>`).join('');
+        const report = [
             ['Primary sourcebook pages discovered', primaryPages.length],
-            ['Indexed/reference links discovered', flattenIndexEntries(indexGroups).length],
-            ['Indexed entries appended', includedEntries.length],
+            ['Indexed/reference links discovered', flattenEntries(indexGroups).length],
+            ['Unique indexed source documents appended', refs.length],
             ['Unique HTML documents requested', state.fetchCache.size],
-            ['Capture failures', allFailures.length]
-        ].map(([a, b]) => `<tr><th>${escapeHtml(a)}</th><td>${escapeHtml(b)}</td></tr>`).join('');
+            ['Capture failures', failures.length]
+        ].map(([a,b]) => `<tr><th>${escapeHtml(a)}</th><td>${b}</td></tr>`).join('');
 
-        const failureList = allFailures.length
-            ? `<h2>Warnings</h2><ul>${allFailures.map(f =>
-                `<li><strong>${escapeHtml(f.type)}: ${escapeHtml(f.name || '')}</strong> — ${escapeHtml(f.error)}</li>`
-              ).join('')}</ul>`
-            : '<p>No capture failures were reported.</p>';
-
-        const coverUrl = findCoverArt();
-
-        return `<!doctype html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>${escapeHtml(bookTitle)}</title>
-    ${currentStylesheetLinks()}
-    ${printCss()}
-</head>
-<body>
-    <div class="ddb-pdf-toolbar">
-        <button id="ddbPrint">Print / Save PDF</button>
-        <button id="ddbClose">Close</button>
-        <span class="ddb-status">
-            ${primaryPages.length} pages •
-            ${flattenIndexEntries(indexGroups).length} indexed links •
-            ${allFailures.length} warnings
-        </span>
-    </div>
-
-    <section class="ddb-cover">
-        <h1>${escapeHtml(bookTitle)}</h1>
-        ${coverUrl ? `<img src="${escapeHtml(coverUrl)}" alt="${escapeHtml(bookTitle)} cover">` : ''}
-        <div class="ddb-source">
-            Built from sourcebook content accessible to the currently logged-in D&D Beyond account.<br>
-            ${escapeHtml(location.origin + bookRoot)}
-        </div>
-    </section>
-
-    <section class="ddb-generated-toc">
-        <h1>Contents</h1>
-        <ol>${tocItems}</ol>
-        ${generatedIndex}
-    </section>
-
-    ${primaryHtml}
-    ${indexedHtml}
-
-    <section class="ddb-report">
-        <h1>Capture Report</h1>
-        <table>${reportRows}</table>
-        ${failureList}
-    </section>
-</body>
-</html>`;
+        return `<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(bookTitle)}</title>${stylesheetLinks()}${css()}</head><body>
+<div class="ddb-pdf-toolbar"><button id="ddbPrint">Print / Save PDF</button><button id="ddbClose">Close</button><span class="ddb-status">${primaryPages.length} primary pages • ${flattenEntries(indexGroups).length} indexed links • ${refs.length} indexed documents • ${failures.length} warnings</span></div>
+<section class="ddb-cover"><h1>${escapeHtml(bookTitle)}</h1>${cover ? `<img src="${escapeHtml(cover)}" alt="${escapeHtml(bookTitle)} cover">` : ''}<div class="ddb-source">Built from sourcebook content accessible to the currently logged-in D&D Beyond account.<br>${escapeHtml(location.origin + root)}</div></section>
+<section class="ddb-generated-toc"><h1>Contents</h1><ol>${toc}</ol>${buildIndex(indexGroups, targetMap)}</section>
+<main class="ddb-content-root">${lead.join('\n')}${refHtml}${tail.join('\n')}</main>
+<section class="ddb-report"><h1>Capture Report</h1><table>${report}</table>${failures.length ? `<h2>Warnings</h2><ul>${failures.map(f => `<li>${escapeHtml(f.label || '')}: ${escapeHtml(f.error)}</li>`).join('')}</ul>` : '<p>No capture failures were reported.</p>'}</section>
+</body></html>`;
     }
 
-    async function waitForAssets(preview) {
-        const doc = preview.document;
-
-        const imageWaits = [...doc.images].map(img => {
-            if (img.complete) return Promise.resolve();
-
-            return new Promise(resolve => {
-                img.addEventListener('load', resolve, { once: true });
-                img.addEventListener('error', resolve, { once: true });
-                setTimeout(resolve, 15000);
-            });
-        });
-
-        await Promise.allSettled(imageWaits);
-
-        try {
-            if (doc.fonts?.ready) {
-                await Promise.race([doc.fonts.ready, sleep(10000)]);
-            }
-        } catch {
-            // Fonts are helpful but not required.
-        }
+    async function waitForAssets(win) {
+        const doc = win.document;
+        await Promise.allSettled([...doc.images].map(img => img.complete ? Promise.resolve() : new Promise(resolve => {
+            img.addEventListener('load', resolve, { once: true });
+            img.addEventListener('error', resolve, { once: true });
+            setTimeout(resolve, 15000);
+        })));
+        try { if (doc.fonts?.ready) await Promise.race([doc.fonts.ready, sleep(10000)]); } catch {}
     }
 
-    function chooseEntriesToAppend(indexEntries, primaryPages) {
-        const primaryBaseUrls = new Set(primaryPages.map(p => urlWithoutHash(p.url)));
-        const entriesIncludedByPage = new Set();
-        const append = [];
-
-        for (const entry of indexEntries) {
-            const exact = normalizeComparableUrl(entry.url);
-
-            if (entry.fragment && primaryBaseUrls.has(entry.fetchUrl)) {
-                entriesIncludedByPage.add(exact);
-                continue;
-            }
-
-            append.push(entry);
-        }
-
-        return { append, entriesIncludedByPage };
+    function button(text) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.textContent = text;
+        Object.assign(b.style, { cursor: 'pointer', padding: '9px 13px', fontWeight: '700' });
+        return b;
     }
 
-    function makeButton(text) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.textContent = text;
-        Object.assign(button.style, {
-            cursor: 'pointer',
-            padding: '9px 13px',
-            fontWeight: '700'
-        });
-        return button;
-    }
-
-    const bookRoot = determineBookRoot();
-
-    if (!bookRoot || !isBookLandingPage(bookRoot)) {
-        log('Open the main landing/Contents page of a sourcebook to use the builder.');
-        return;
-    }
+    const root = determineBookRoot();
+    if (!root || !isLandingPage(root)) return;
 
     const panel = document.createElement('div');
-    Object.assign(panel.style, {
-        position: 'fixed',
-        right: '18px',
-        bottom: '18px',
-        zIndex: '2147483647',
-        display: 'flex',
-        gap: '8px',
-        alignItems: 'center',
-        padding: '10px',
-        borderRadius: '8px',
-        background: '#202020',
-        color: '#fff',
-        boxShadow: '0 3px 16px rgba(0,0,0,.4)',
-        fontFamily: 'Arial, sans-serif'
-    });
+    Object.assign(panel.style, { position:'fixed', right:'18px', bottom:'18px', zIndex:'2147483647', display:'flex', gap:'8px', alignItems:'center', padding:'10px', borderRadius:'8px', background:'#202020', color:'#fff', boxShadow:'0 3px 16px #0006', fontFamily:'Arial,sans-serif' });
+    const buildBtn = button('Build Offline PDF');
+    const cancelBtn = button('Cancel'); cancelBtn.disabled = true;
+    const status = document.createElement('span'); status.textContent = 'Ready'; Object.assign(status.style, { fontSize:'12px', maxWidth:'240px' });
+    panel.append(buildBtn, cancelBtn, status); document.body.appendChild(panel);
 
-    const generateButton = makeButton('Build Offline PDF');
-    const cancelButton = makeButton('Cancel');
-    cancelButton.disabled = true;
+    cancelBtn.onclick = () => { state.cancelled = true; cancelBtn.disabled = true; cancelBtn.textContent = 'Cancelling…'; };
 
-    const miniStatus = document.createElement('span');
-    miniStatus.textContent = 'Ready';
-    Object.assign(miniStatus.style, {
-        fontSize: '12px',
-        maxWidth: '220px'
-    });
-
-    panel.append(generateButton, cancelButton, miniStatus);
-    document.body.appendChild(panel);
-
-    cancelButton.addEventListener('click', () => {
-        state.cancelled = true;
-        cancelButton.disabled = true;
-        cancelButton.textContent = 'Cancelling…';
-    });
-
-    generateButton.addEventListener('click', async () => {
+    buildBtn.onclick = async () => {
         if (state.running) return;
-
-        state.running = true;
-        state.cancelled = false;
-        state.fetchCache.clear();
-        state.failures = [];
-
-        generateButton.disabled = true;
-        cancelButton.disabled = false;
-        cancelButton.textContent = 'Cancel';
+        state.running = true; state.cancelled = false; state.fetchCache.clear();
+        buildBtn.disabled = true; cancelBtn.disabled = false; cancelBtn.textContent = 'Cancel';
 
         const preview = window.open('about:blank', '_blank');
-
         if (!preview) {
-            alert(
-                'The browser blocked the preview tab. Allow popups for www.dndbeyond.com, then try again.'
-            );
-            state.running = false;
-            generateButton.disabled = false;
-            cancelButton.disabled = true;
-            return;
+            alert('Allow popups for www.dndbeyond.com, then try again.');
+            state.running = false; buildBtn.disabled = false; cancelBtn.disabled = true; return;
         }
 
-        preview.document.open();
-        preview.document.write(`<!doctype html>
-<html>
-<head><title>Building sourcebook…</title></head>
-<body style="font-family:Arial,sans-serif;padding:40px">
-    <h1>Building sourcebook…</h1>
-    <p id="ddbBuildStatus">Discovering book structure…</p>
-    <p>Leave the original D&D Beyond tab open until this finishes.</p>
-</body>
-</html>`);
+        preview.document.write('<!doctype html><html><body style="font-family:Arial;padding:40px"><h1>Building sourcebook…</h1><p id="ddbBuildStatus">Discovering book structure…</p></body></html>');
         preview.document.close();
-
-        const setStatus = (text) => {
-            miniStatus.textContent = text;
-            try {
-                const el = preview.document.getElementById('ddbBuildStatus');
-                if (el) el.textContent = text;
-            } catch {
-                // preview may have been closed
-            }
-        };
+        const setStatus = t => { status.textContent = t; try { const e = preview.document.getElementById('ddbBuildStatus'); if (e) e.textContent = t; } catch {} };
 
         try {
             const bookTitle = cleanBookTitle();
-            const primaryPages = discoverPrimaryPages(bookRoot);
-            const indexGroups = discoverIndexGroups(bookRoot);
-            const indexEntries = flattenIndexEntries(indexGroups);
+            const primaryPages = discoverPrimaryPages(root);
+            const indexGroups = discoverIndexGroups(root);
+            const entries = flattenEntries(indexGroups);
+            const refs = buildReferenceDocuments(entries, primaryPages);
 
-            log('Primary pages:', primaryPages);
-            log('Index groups:', indexGroups);
-
-            if (!primaryPages.length) {
-                throw new Error(
-                    'No sourcebook pages were discovered. Make sure you are on the book\'s main Contents page.'
-                );
-            }
-
-            const { append: includedEntries, entriesIncludedByPage } =
-                chooseEntriesToAppend(indexEntries, primaryPages);
-
-            const { pageMap, exactEntryMap } =
-                buildPageMaps(primaryPages, includedEntries);
+            if (!primaryPages.length) throw new Error('No sourcebook pages found. Open the book main Contents page.');
 
             const primaryResults = new Array(primaryPages.length);
-
             for (let i = 0; i < primaryPages.length; i++) {
                 if (state.cancelled) throw new Error('Download cancelled.');
-
-                const page = primaryPages[i];
-                setStatus(`Book pages ${i + 1}/${primaryPages.length}: ${page.label}`);
-
+                const p = primaryPages[i]; setStatus(`Book pages ${i+1}/${primaryPages.length}: ${p.label}`);
                 try {
-                    const html = await fetchDocumentHtml(page.url);
-                    const extracted = extractPrimaryPage(html, page.url, page.label);
-
-                    primaryResults[i] = {
-                        ...extracted,
-                        sourceUrl: page.url,
-                        label: page.label
-                    };
-                } catch (error) {
-                    primaryResults[i] = {
-                        error: error?.message || String(error),
-                        sourceUrl: page.url,
-                        label: page.label
-                    };
-                    warn('Primary page failed:', page.url, error);
-                }
-
-                if (i < primaryPages.length - 1) {
-                    await sleep(randomDelay());
-                }
+                    const html = await fetchHtml(p.url);
+                    primaryResults[i] = { ...extractDocument(html, p.url, p.label, p.id), sourceUrl:p.url, label:p.label };
+                } catch (e) { primaryResults[i] = { error:e?.message || String(e), sourceUrl:p.url, label:p.label }; warn(e); }
+                if (i < primaryPages.length - 1) await sleep(delay());
             }
 
-            const entryResults = new Array(includedEntries.length);
-
-            for (let i = 0; i < includedEntries.length; i++) {
+            const refResults = new Array(refs.length);
+            for (let i = 0; i < refs.length; i++) {
                 if (state.cancelled) throw new Error('Download cancelled.');
-
-                const entry = includedEntries[i];
-                setStatus(`Indexed entries ${i + 1}/${includedEntries.length}: ${entry.label}`);
-
-                const wasAlreadyCached = state.fetchCache.has(entry.fetchUrl);
-
+                const d = refs[i]; setStatus(`Indexed documents ${i+1}/${refs.length}: ${d.label}`);
                 try {
-                    const html = await fetchDocumentHtml(entry.fetchUrl);
-                    const node = extractIndexedEntry(html, entry);
-
-                    entryResults[i] = {
-                        node,
-                        sourceUrl: entry.url,
-                        label: entry.label
-                    };
-                } catch (error) {
-                    entryResults[i] = {
-                        error: error?.message || String(error),
-                        sourceUrl: entry.url,
-                        label: entry.label
-                    };
-                    warn('Indexed entry failed:', entry.url, error);
-                }
-
-                if (!wasAlreadyCached && i < includedEntries.length - 1) {
-                    await sleep(randomDelay());
-                }
+                    const html = await fetchHtml(d.url);
+                    refResults[i] = { ...extractDocument(html, d.url, d.label, d.id), sourceUrl:d.url, label:d.label };
+                } catch (e) { refResults[i] = { error:e?.message || String(e), sourceUrl:d.url, label:d.label }; warn(e); }
+                if (i < refs.length - 1) await sleep(delay());
             }
 
-            if (state.cancelled) throw new Error('Download cancelled.');
-
+            const { documentMap, targetMap } = buildMaps(primaryPages, primaryResults, refs, refResults, entries);
             setStatus('Building print-ready book…');
+            const html = buildDocument({ bookTitle, root, primaryPages, primaryResults, refs, refResults, indexGroups, documentMap, targetMap });
+            preview.document.open(); preview.document.write(html); preview.document.close();
 
-            const finalHtml = buildFinalDocument({
-                bookTitle,
-                bookRoot,
-                primaryPages,
-                primaryResults,
-                indexGroups,
-                includedEntries,
-                entryResults,
-                entriesIncludedByPage,
-                pageMap,
-                exactEntryMap
-            });
-
-            preview.document.open();
-            preview.document.write(finalHtml);
-            preview.document.close();
-
-            const printButton = preview.document.getElementById('ddbPrint');
-            const closeButton = preview.document.getElementById('ddbClose');
-
-            if (printButton) {
-                printButton.disabled = true;
-                printButton.textContent = 'Loading images…';
-            }
-
-            if (closeButton) {
-                closeButton.addEventListener('click', () => preview.close());
-            }
-
+            const printBtn = preview.document.getElementById('ddbPrint');
+            const closeBtn = preview.document.getElementById('ddbClose');
+            if (printBtn) { printBtn.disabled = true; printBtn.textContent = 'Loading images…'; }
+            if (closeBtn) closeBtn.onclick = () => preview.close();
             await waitForAssets(preview);
+            if (printBtn) { printBtn.disabled = false; printBtn.textContent = 'Print / Save PDF'; printBtn.onclick = () => { preview.focus(); preview.print(); }; }
 
-            if (printButton) {
-                printButton.disabled = false;
-                printButton.textContent = 'Print / Save PDF';
-                printButton.addEventListener('click', () => {
-                    preview.focus();
-                    preview.print();
-                });
-            }
-
-            const failureCount =
-                primaryResults.filter(r => r?.error).length +
-                entryResults.filter(r => r?.error).length;
-
-            setStatus(
-                `Ready: ${primaryPages.length} pages, ` +
-                `${indexEntries.length} indexed links, ${failureCount} warnings`
-            );
-
-            log('Complete', {
-                primaryPages: primaryPages.length,
-                indexedLinks: indexEntries.length,
-                appendedEntries: includedEntries.length,
-                uniqueDocuments: state.fetchCache.size,
-                failures: failureCount
-            });
-        } catch (error) {
-            warn(error);
-
-            try {
-                const el = preview.document.getElementById('ddbBuildStatus');
-                if (el) {
-                    el.textContent = error?.message || String(error);
-                    el.style.color = 'darkred';
-                }
-            } catch {
-                // ignored
-            }
-
-            miniStatus.textContent = 'Failed';
+            const failures = [...primaryResults, ...refResults].filter(r => r?.error).length;
+            setStatus(`Ready: ${primaryPages.length} primary pages, ${entries.length} indexed links, ${refs.length} indexed documents, ${failures} warnings`);
+            log('Complete', { primaryPages:primaryPages.length, indexedLinks:entries.length, indexedDocuments:refs.length, uniqueDocuments:state.fetchCache.size, failures });
+        } catch (e) {
+            warn(e); status.textContent = 'Failed';
+            try { const x = preview.document.getElementById('ddbBuildStatus'); if (x) { x.textContent = e?.message || String(e); x.style.color = 'darkred'; } } catch {}
         } finally {
-            state.running = false;
-            generateButton.disabled = false;
-            generateButton.textContent = 'Build Offline PDF';
-            cancelButton.disabled = true;
-            cancelButton.textContent = 'Cancel';
+            state.running = false; buildBtn.disabled = false; buildBtn.textContent = 'Build Offline PDF'; cancelBtn.disabled = true; cancelBtn.textContent = 'Cancel';
         }
-    });
+    };
 })();
