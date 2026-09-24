@@ -6,9 +6,9 @@ A Tampermonkey userscript that builds a print-ready, offline-friendly version of
 
 ## Current version
 
-**v0.7.0**
+**v0.8.0**
 
-v0.7 adds generic structure-driven print polish across D&D Beyond sourcebooks and adventures. It improves spacing between discrete indexed entries, protects compact tables from awkward page splits, and applies more consistent heading spacing without adding book-specific logic.
+v0.8 adds mixed modern/legacy D&D Beyond source-path support for adventure books and refines v0.7 pagination efficiency while keeping the exporter structure-driven and book-agnostic.
 
 ## Design principle
 
@@ -44,6 +44,18 @@ That same logic is intended to work across adventures, rulebooks, setting books,
 - Resolves common lazy-loaded images and waits for images/fonts before enabling printing.
 - Produces US Letter print-oriented output.
 - Keeps the Capture Report visible in the preview while hiding it from printed/PDF output by default.
+
+## v0.8 adventure compatibility and pagination efficiency
+
+v0.8 supports D&D Beyond books whose landing page uses `/sources/dnd/<slug>` while actual chapter pages still use `/sources/<slug>/...`. The builder treats both path forms as aliases for the same book instead of hard-coding individual adventure titles.
+
+Additional changes:
+
+- large generated indexes with 80+ entries print in two columns;
+- indexed-entry headings keep only one compact opening metadata line attached, reducing unnecessary whitespace;
+- artwork/credit grouping is less aggressive and maximum print image height is slightly reduced;
+- generic `Creatures`, `NPCs`, and `Sidekicks` headings can participate in reference discovery;
+- existing v0.5 duplicate prevention, v0.6 table reconstruction, and v0.7 entry spacing remain intact.
 
 ## v0.7 generic print polish
 
@@ -201,7 +213,7 @@ If it opens as plain text:
 6. Confirm the metadata header shows:
 
 ```javascript
-// @version      0.7.0
+// @version      0.8.0
 ```
 
 7. Reload the D&D Beyond sourcebook page.

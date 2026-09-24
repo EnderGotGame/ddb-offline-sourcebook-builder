@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.0 - 2026-09-23
+
+### Fixed
+
+- Adventure/source discovery now accepts both modern `/sources/dnd/<slug>` and legacy `/sources/<slug>/...` paths for the same book.
+- Adventure books such as Shadow of the Dragon Queen no longer fail with `No sourcebook pages found` solely because their chapter URLs use the legacy route.
+
+### Changed
+
+- Large generated indexes with 80+ entries use a two-column print layout.
+- Indexed-entry keep-together behavior now protects only one compact opening line.
+- Artwork/credit grouping is less aggressive and image height is slightly reduced to cut sparse pages.
+- Reference-document spacing is slightly tighter while preserving visual separation.
+- Generic `Creatures`, `NPCs`, and `Sidekicks` headings are recognized as possible reference collections.
+
 ## 0.7.0 - 2026-09-23
 
 ### Added
