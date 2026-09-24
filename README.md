@@ -6,9 +6,28 @@ A Tampermonkey userscript that builds a print-ready, offline-friendly version of
 
 ## Current version
 
-**v0.6.0**
+**v0.7.0**
 
-v0.6 adds semantic print reconstruction for stat blocks and sourcebook tables. This was added after reviewing a generated 2024 Monster Manual PDF where the captured data was correct but ability-score tables and other reference tables were flattened and difficult to scan.
+v0.7 adds generic structure-driven print polish across D&D Beyond sourcebooks and adventures. It improves spacing between discrete indexed entries, protects compact tables from awkward page splits, and applies more consistent heading spacing without adding book-specific logic.
+
+## Design principle
+
+This project is intentionally **not tailored to individual books**.
+
+The Monster Manual is useful as a stress test because it contains hundreds of indexed entries, but the script is designed around reusable document semantics rather than checks such as `if book === Monster Manual`.
+
+Where possible, the builder reacts to structural features such as:
+
+- table-of-contents pages;
+- indexed/reference links;
+- fragment targets;
+- heading hierarchy;
+- short versus long tables;
+- structured stat/rules blocks;
+- artwork and captions;
+- source-document boundaries.
+
+That same logic is intended to work across adventures, rulebooks, setting books, bestiaries, character-option books, and future D&D Beyond source layouts.
 
 ## Highlights
 
@@ -25,6 +44,48 @@ v0.6 adds semantic print reconstruction for stat blocks and sourcebook tables. T
 - Resolves common lazy-loaded images and waits for images/fonts before enabling printing.
 - Produces US Letter print-oriented output.
 - Keeps the Capture Report visible in the preview while hiding it from printed/PDF output by default.
+
+## v0.7 generic print polish
+
+v0.7 improves readability without assuming that an indexed entry is specifically a monster, spell, item, NPC, location, or encounter.
+
+### Discrete entry spacing
+
+When an index/reference link points to a fragment inside a captured source document, the script marks that target as a generic content-entry boundary.
+
+The print stylesheet then adds:
+
+- additional top spacing;
+- a subtle divider;
+- stronger visual separation from the previous entry;
+- page-break hints to keep the heading attached to the opening metadata when practical.
+
+This applies equally to monsters, spells, items, feats, backgrounds, NPCs, locations, rules references, and other indexed content.
+
+### Heading hierarchy
+
+Captured sourcebook content receives more consistent spacing for `h1` through `h6` headings so adjacent sections do not visually run together.
+
+Major headings receive more breathing room than lower-level subsections while still being allowed to flow naturally across printed pages.
+
+### Short tables
+
+Tables with up to 12 rows are treated as compact reference tables and are preferentially kept on one printed page.
+
+A nearby table heading is also kept with the table when practical.
+
+This is useful for:
+
+- d6/d8/d10/d12 random tables;
+- encounter tables;
+- rumors;
+- complications;
+- small treasure tables;
+- NPC traits;
+- appearance tables;
+- other compact lookup tables.
+
+Long tables remain splittable and retain repeated table headers where the browser supports them.
 
 ## v0.6 stat-block and table improvements
 
@@ -52,7 +113,7 @@ Large stat blocks are still allowed to span multiple sheets naturally.
 
 ### Ordinary sourcebook tables
 
-Captured HTML tables now receive consistent print styling:
+Captured HTML tables receive consistent print styling:
 
 - visible cell borders;
 - shaded header rows;
@@ -61,28 +122,27 @@ Captured HTML tables now receive consistent print styling:
 - compact first columns for dice/random-result tables;
 - row-level page-break protection where practical.
 
-This applies to tables such as random appearance/composition tables, challenge-rating tables, lookup tables, and similar book content.
+This applies to random tables, challenge-rating tables, lookup tables, encounter tables, and similar book content.
 
 ## Why indexes are treated as navigation
 
-The 2024 Monster Manual demonstrates why indexed links cannot simply be appended one at a time.
+Large indexes cannot safely be handled by appending every logical entry as a separate copy.
 
-An index can contain links such as:
-
-```text
-/monsters-a#aarakocra
-/monsters-a#aarakocra-aeromancer
-/monsters-a#aarakocra-skirmisher
-/monsters-a#aboleth
-```
-
-Those logical targets can all live inside one underlying HTML document:
+For example, links such as:
 
 ```text
-/monsters-a
+/reference-page#entry-a
+/reference-page#entry-b
+/reference-page#entry-c
 ```
 
-The builder therefore:
+can all live in the same underlying HTML document:
+
+```text
+/reference-page
+```
+
+The builder therefore uses this model:
 
 ```text
 logical index links
@@ -98,7 +158,7 @@ include each document once
 rewrite index links to local anchors
 ```
 
-This prevents grouped monster pages from being duplicated in the finished PDF.
+This avoids duplicate content while preserving offline navigation.
 
 ## Print-first pagination
 
@@ -108,8 +168,10 @@ It also:
 
 - uses a simple block-layout cover;
 - lets normal prose and subsections flow naturally;
-- allows large stat blocks to span pages;
+- allows large stat/rules blocks to span pages;
 - keeps headings with following content where practical;
+- gives discrete indexed entries additional visual separation;
+- keeps compact tables intact where practical;
 - limits artwork to the printable page height;
 - groups short artist credits with following artwork when that pattern is detected;
 - hides the diagnostic Capture Report from printed/PDF output by default.
@@ -139,12 +201,12 @@ If it opens as plain text:
 6. Confirm the metadata header shows:
 
 ```javascript
-// @version      0.6.0
+// @version      0.7.0
 ```
 
 7. Reload the D&D Beyond sourcebook page.
 
-Do not manually merge v0.6 functions into an older copy; replace the entire userscript.
+Do not manually merge v0.7 functions into an older copy; replace the entire userscript.
 
 ## Usage
 
@@ -224,11 +286,15 @@ Open the same target normally while logged in and verify that the account has ac
 
 ### A stat block did not get a reconstructed ability table
 
-The v0.6 transformer is deliberately conservative. It only replaces the source ability layout when all six ability scores, modifiers, and save values can be parsed from the captured table markup. If D&D Beyond changes that markup, the original data remains visible rather than being discarded.
+The transformer is deliberately conservative. It only replaces the source ability layout when all six ability scores, modifiers, and save values can be parsed from the captured table markup. If D&D Beyond changes that markup, the original data remains visible rather than being discarded.
 
 ### A normal table still looks wrong
 
 Report the book/section and generated PDF page. Different sourcebooks sometimes use non-table div/grid components that may need an additional semantic print transformer.
+
+### A short table still splits
+
+The script protects compact HTML tables with up to 12 rows, but browser pagination can still override this when the table is physically taller than the printable area or when D&D Beyond uses a non-table grid component.
 
 ## Privacy and security
 
