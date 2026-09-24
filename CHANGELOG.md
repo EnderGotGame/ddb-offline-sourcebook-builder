@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0 - 2026-09-23
+
+### Added
+
+- Generic indexed-entry boundary detection based on document structure and fragment targets rather than book names or content types.
+- Additional spacing and a subtle separator before discrete indexed entries so adjacent monsters, spells, items, NPCs, locations, and other reference entries do not visually run together.
+- Generic opening-content grouping hints so a discrete entry heading stays visually attached to the first short metadata/subtitle lines when practical.
+- Short-table detection for compact tables with up to 12 rows.
+- Page-break protection for short tables and nearby table headings so small d6/d8/d10/d12 lookup tables are less likely to split awkwardly across pages.
+- More consistent heading hierarchy spacing for h1-h6 content throughout captured sourcebooks and adventures.
+- Additional spacing/separation between independently captured reference documents.
+
+### Changed
+
+- Print polish remains structure-driven and feature-driven. v0.7 contains no Monster Manual-specific, adventure-specific, or sourcebook-name checks.
+- Indexed-entry styling now applies to any discrete reference target exposed by a D&D Beyond book, including monsters, spells, magic items, feats, backgrounds, species, NPCs, locations, encounters, rules entries, and similar content.
+- Long tables remain splittable while compact tables are preferentially kept intact.
+- Existing v0.5 document-level duplicate prevention and v0.6 stat-block/table reconstruction remain unchanged.
+
 ## 0.6.0 - 2026-09-23
 
 ### Added
