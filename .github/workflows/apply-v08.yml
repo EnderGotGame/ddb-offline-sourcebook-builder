@@ -16,11 +16,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Patch userscript
+      - name: Patch and validate userscript
         shell: bash
         run: |
           python <<'PY'
           from pathlib import Path
+          import re
 
           path = Path('ddb-offline-sourcebook-builder.user.js')
           s = path.read_text(encoding='utf-8')
@@ -32,162 +33,83 @@ jobs:
               s = s.replace(old, new, 1)
 
           swap('// @version      0.7.0', '// @version      0.8.0', 'version')
-          swap("        if (p[1] === 'dnd' && p[2]) return '/' + p.slice(0, 3).join('/');",
-               "        if (p[1] === 'dnd') return p[2] ? '/' + p.slice(0, 3).join('/') : null;",
-               'modern root line')
+          swap("        if (p[1] === 'dnd' && p[2]) return '/' + p.slice(0, 3).join('/');", "        if (p[1] === 'dnd') return p[2] ? '/' + p.slice(0, 3).join('/') : null;", 'root')
 
           marker = "    function isLandingPage(root) {"
+          helpers = "\n".join([
+              "    function determineBookRoots(root) {",
+              "        if (!root) return [];",
+              "        const parts = root.split('/').filter(Boolean);",
+              "        const roots = new Set([root.replace(/\\/+$/, '')]);",
+              "        let slug = null;",
+              "        if (parts[0] === 'sources' && parts[1] === 'dnd' && parts[2]) slug = parts[2];",
+              "        else if (parts[0] === 'sources' && parts[1]) slug = parts[1];",
+              "        if (slug) {",
+              "            roots.add(`/sources/${slug}`);",
+              "            roots.add(`/sources/dnd/${slug}`);",
+              "        }",
+              "        return [...roots];",
+              "    }",
+              "",
+              "    function pathBelongsToBook(pathname, bookRoots) {",
+              "        const path = pathname.replace(/\\/+$/, '');",
+              "        return bookRoots.some(root => path === root || path.startsWith(root + '/'));",
+              "    }",
+              "",
+              "    function isBookRootPath(pathname, bookRoots) {",
+              "        const path = pathname.replace(/\\/+$/, '');",
+              "        return bookRoots.some(root => path === root);",
+              "    }",
+              ""
+          ]) + "\n"
           if marker not in s:
               raise SystemExit('Patch target not found: landing marker')
-          alias_helpers = '''    function determineBookRoots(root) {
-              if (!root) return [];
+          s = s.replace(marker, helpers + marker, 1)
 
-              const parts = root.split('/').filter(Boolean);
-              const roots = new Set([root.replace(/\\/+$/, '')]);
-
-              // D&D Beyond can mix modern landing URLs with legacy chapter URLs.
-              // Treat both source-root forms as aliases for the same book.
-              let slug = null;
-              if (parts[0] === 'sources' && parts[1] === 'dnd' && parts[2]) {
-                  slug = parts[2];
-              } else if (parts[0] === 'sources' && parts[1]) {
-                  slug = parts[1];
-              }
-
-              if (slug) {
-                  roots.add(`/sources/${slug}`);
-                  roots.add(`/sources/dnd/${slug}`);
-              }
-
-              return [...roots];
-          }
-
-          function pathBelongsToBook(pathname, bookRoots) {
-              const path = pathname.replace(/\\/+$/, '');
-              return bookRoots.some(root => path === root || path.startsWith(root + '/'));
-          }
-
-          function isBookRootPath(pathname, bookRoots) {
-              const path = pathname.replace(/\\/+$/, '');
-              return bookRoots.some(root => path === root);
-          }
-
-'''
-          s = s.replace(marker, alias_helpers + marker, 1)
-
-          swap('    function isSameBook(url, root) {', '    function isSameBook(url, bookRoots) {', 'same-book signature')
-          swap("            return u.origin === location.origin && (u.pathname === root || u.pathname.startsWith(root + '/'));",
-               '            return u.origin === location.origin && pathBelongsToBook(u.pathname, bookRoots);',
-               'same-book body')
-
+          swap('    function isSameBook(url, root) {', '    function isSameBook(url, bookRoots) {', 'isSameBook signature')
+          swap("            return u.origin === location.origin && (u.pathname === root || u.pathname.startsWith(root + '/'));", '            return u.origin === location.origin && pathBelongsToBook(u.pathname, bookRoots);', 'isSameBook body')
           swap('    function discoverPrimaryPages(root) {', '    function discoverPrimaryPages(root, bookRoots) {', 'primary signature')
-          swap("        if (!links.length) links = [...mainEl().querySelectorAll('a[href]')].filter(a => isSameBook(a.href, root));",
-               "        if (!links.length) links = [...mainEl().querySelectorAll('a[href]')].filter(a => isSameBook(a.href, bookRoots));",
-               'primary fallback')
+          swap("        if (!links.length) links = [...mainEl().querySelectorAll('a[href]')].filter(a => isSameBook(a.href, root));", "        if (!links.length) links = [...mainEl().querySelectorAll('a[href]')].filter(a => isSameBook(a.href, bookRoots));", 'primary fallback')
           swap('            if (!isSameBook(u.href, root)) continue;', '            if (!isSameBook(u.href, bookRoots)) continue;', 'primary match')
-          swap("            if (u.pathname.replace(/\\/+$/, '') === root.replace(/\\/+$/, '')) continue;",
-               '            if (isBookRootPath(u.pathname, bookRoots)) continue;',
-               'primary root skip')
-
+          swap("            if (u.pathname.replace(/\\/+$/, '') === root.replace(/\\/+$/, '')) continue;", '            if (isBookRootPath(u.pathname, bookRoots)) continue;', 'root skip')
           swap('    function discoverIndexGroups(root) {', '    function discoverIndexGroups(root, bookRoots) {', 'index signature')
-          swap('                const sameBookFragment = isSameBook(u.href, root) && Boolean(u.hash);',
-               '                const sameBookFragment = isSameBook(u.href, bookRoots) && Boolean(u.hash);',
-               'index match')
-          swap('monster entries?|magic items?', 'monster entries?|creatures?|npcs?|sidekicks?|magic items?', 'generic reference headings')
-
-          anchor_block = '''        root.querySelectorAll('a[href]').forEach(a => {
-              const href = a.getAttribute('href');
-              if (href && !href.startsWith('#')) a.setAttribute('href', absoluteUrl(href, sourceUrl));
-          });
-'''
-          asset_block = '''        root.querySelectorAll('source').forEach(source => {
-              const src = source.getAttribute('src');
-              if (src) source.setAttribute('src', absoluteUrl(src, sourceUrl));
-
-              const srcset = source.getAttribute('srcset');
-              if (srcset && !srcset.startsWith('data:')) {
-                  source.setAttribute('srcset', srcset.split(',').map(x => {
-                      const parts = x.trim().split(/\\s+/);
-                      parts[0] = absoluteUrl(parts[0], sourceUrl);
-                      return parts.join(' ');
-                  }).join(', '));
-              }
-          });
-
-          root.querySelectorAll('[style]').forEach(el => {
-              const style = el.getAttribute('style');
-              if (!style || !style.includes('url(')) return;
-              el.setAttribute('style', style.replace(/url\\((['\"]?)(.*?)\\1\\)/gi, (match, quote, assetUrl) => {
-                  if (/^(data:|blob:)/i.test(assetUrl)) return match;
-                  return `url("${absoluteUrl(assetUrl, sourceUrl)}")`;
-              }));
-          });
-
-'''
-          normalize_start = s.index('    function normalizeAssets(root, sourceUrl) {')
-          cleanup_start = s.index('    function cleanupContent(content, sourceUrl) {', normalize_start)
-          section = s[normalize_start:cleanup_start]
-          if anchor_block not in section:
-              raise SystemExit('Patch target not found: asset anchor block')
-          section = section.replace(anchor_block, asset_block + anchor_block, 1)
-          s = s[:normalize_start] + section + s[cleanup_start:]
+          swap('                const sameBookFragment = isSameBook(u.href, root) && Boolean(u.hash);', '                const sameBookFragment = isSameBook(u.href, bookRoots) && Boolean(u.hash);', 'index match')
+          swap('monster entries?|magic items?', 'monster entries?|creatures?|npcs?|sidekicks?|magic items?', 'reference headings')
 
           swap('            while (sibling && tagged < 2) {', '            while (sibling && tagged < 1) {', 'opening count')
-          swap('                if (!compactText || compactText.length > 260) break;',
-               '                if (!compactText || compactText.length > 190) break;',
-               'opening length')
+          swap('                if (!compactText || compactText.length > 260) break;', '                if (!compactText || compactText.length > 190) break;', 'opening length')
 
-          swap('.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}',
-               '.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}.ddb-generated-index.ddb-large-index ul{column-count:2;column-gap:1.4rem;column-fill:auto}.ddb-generated-index.ddb-large-index li{break-inside:avoid-column!important;page-break-inside:avoid!important}',
-               'large index CSS')
-          swap('.ddb-reference-document+.ddb-reference-document{margin-top:1.65em!important;padding-top:.75em!important;border-top:1px solid #b8aa96!important}',
-               '.ddb-reference-document+.ddb-reference-document{margin-top:1.45em!important;padding-top:.62em!important;border-top:1px solid #b8aa96!important}',
-               'reference spacing')
-          swap('.ddb-content-entry-start+.ddb-entry-opening-part,.ddb-content-entry-start+.ddb-entry-opening-part+.ddb-entry-opening-part{break-before:avoid-page!important;page-break-before:avoid!important;break-after:avoid-page!important;page-break-after:avoid!important}',
-               '.ddb-content-entry-start+.ddb-entry-opening-part{break-before:avoid-page!important;page-break-before:avoid!important}',
-               'opening CSS')
-          swap('.ddb-content-root img{max-height:7.25in!important;object-fit:contain!important}',
-               '.ddb-content-root img{max-height:6.9in!important;object-fit:contain!important}',
-               'image height')
-          swap('.ddb-art-block{clear:both;break-inside:avoid-page!important;page-break-inside:avoid!important;margin:.35em 0 .75em}.ddb-art-block>:first-child{break-after:avoid-page!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:7.05in!important;margin:.15em auto 0!important}',
-               '.ddb-art-block{clear:both;break-inside:auto!important;page-break-inside:auto!important;margin:.35em 0 .7em}.ddb-art-block>:first-child{break-after:avoid-page!important;page-break-after:avoid!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:6.75in!important;margin:.15em auto 0!important}',
-               'artwork CSS')
+          swap('.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}', '.ddb-generated-toc a,.ddb-generated-index a{color:inherit!important;text-decoration:none!important}.ddb-generated-index.ddb-large-index ul{column-count:2;column-gap:1.4rem;column-fill:auto}.ddb-generated-index.ddb-large-index li{break-inside:avoid-column!important;page-break-inside:avoid!important}', 'index css')
+          swap('.ddb-reference-document+.ddb-reference-document{margin-top:1.65em!important;padding-top:.75em!important;border-top:1px solid #b8aa96!important}', '.ddb-reference-document+.ddb-reference-document{margin-top:1.45em!important;padding-top:.62em!important;border-top:1px solid #b8aa96!important}', 'reference spacing')
+          swap('.ddb-content-entry-start+.ddb-entry-opening-part,.ddb-content-entry-start+.ddb-entry-opening-part+.ddb-entry-opening-part{break-before:avoid-page!important;page-break-before:avoid!important;break-after:avoid-page!important;page-break-after:avoid!important}', '.ddb-content-entry-start+.ddb-entry-opening-part{break-before:avoid-page!important;page-break-before:avoid!important}', 'entry pagination')
+          swap('.ddb-content-root img{max-height:7.25in!important;object-fit:contain!important}', '.ddb-content-root img{max-height:6.9in!important;object-fit:contain!important}', 'image height')
+          swap('.ddb-art-block{clear:both;break-inside:avoid-page!important;page-break-inside:avoid!important;margin:.35em 0 .75em}.ddb-art-block>:first-child{break-after:avoid-page!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:7.05in!important;margin:.15em auto 0!important}', '.ddb-art-block{clear:both;break-inside:auto!important;page-break-inside:auto!important;margin:.35em 0 .7em}.ddb-art-block>:first-child{break-after:avoid-page!important;page-break-after:avoid!important}.ddb-art-block img{display:block!important;width:auto!important;max-width:100%!important;max-height:6.75in!important;margin:.15em auto 0!important}', 'artwork pagination')
 
-          old_index = '''    function buildIndex(groups, targetMap) {
-              return groups.map(g => `<section class="ddb-generated-index"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href="${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`).join('');
-          }
-'''
-          new_index = '''    function buildIndex(groups, targetMap) {
-              return groups.map(g => {
-                  const sizeClass = g.entries.length >= 80 ? ' ddb-large-index' : '';
-                  return `<section class="ddb-generated-index${sizeClass}"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href="${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`;
-              }).join('');
-          }
-'''
-          swap(old_index, new_index, 'index renderer')
+          pattern = r"    function buildIndex\(groups, targetMap\) \{\n.*?\n    \}\n"
+          replacement = "\n".join([
+              "    function buildIndex(groups, targetMap) {",
+              "        return groups.map(g => {",
+              "            const sizeClass = g.entries.length >= 80 ? ' ddb-large-index' : '';",
+              "            return `<section class=\"ddb-generated-index${sizeClass}\"><h2>${escapeHtml(g.title)}</h2><ul>${g.entries.map(e => `<li><a href=\"${escapeHtml(targetMap.get(comparableUrl(e.url)) || e.url)}\">${escapeHtml(e.label)}</a></li>`).join('')}</ul></section>`;",
+              "        }).join('');",
+              "    }",
+              ""
+          ])
+          s2, count = re.subn(pattern, replacement, s, count=1, flags=re.S)
+          if count != 1:
+              raise SystemExit('Patch target not found: buildIndex')
+          s = s2
 
-          swap('    const root = determineBookRoot();\n    if (!root || !isLandingPage(root)) return;',
-               '    const root = determineBookRoot();\n    const bookRoots = determineBookRoots(root);\n    if (!root || !isLandingPage(root)) return;',
-               'root init')
-          swap('            const primaryPages = discoverPrimaryPages(root);',
-               '            const primaryPages = discoverPrimaryPages(root, bookRoots);',
-               'primary discovery call')
-          swap('            const indexGroups = discoverIndexGroups(root);',
-               '            const indexGroups = discoverIndexGroups(root, bookRoots);',
-               'index discovery call')
-          swap("            if (!primaryPages.length) throw new Error('No sourcebook pages found. Open the book main Contents page.');",
-               "            if (!primaryPages.length) throw new Error(`No sourcebook pages found. Detected source roots: ${bookRoots.join(', ')}. Open the book main Contents page and reload.`);",
-               'empty-pages error')
-          swap('            const refs = buildReferenceDocuments(entries, primaryPages);',
-               "            const refs = buildReferenceDocuments(entries, primaryPages);\n            log('Detected source roots', bookRoots);\n            log('Primary source documents', primaryPages.map(p => p.url));",
-               'debug roots')
+          swap('    const root = determineBookRoot();\n    if (!root || !isLandingPage(root)) return;', '    const root = determineBookRoot();\n    const bookRoots = determineBookRoots(root);\n    if (!root || !isLandingPage(root)) return;', 'root init')
+          swap('            const primaryPages = discoverPrimaryPages(root);', '            const primaryPages = discoverPrimaryPages(root, bookRoots);', 'primary call')
+          swap('            const indexGroups = discoverIndexGroups(root);', '            const indexGroups = discoverIndexGroups(root, bookRoots);', 'index call')
+          swap('            const refs = buildReferenceDocuments(entries, primaryPages);', "            const refs = buildReferenceDocuments(entries, primaryPages);\n            log('Detected source roots', bookRoots);\n            log('Primary source documents', primaryPages.map(p => p.url));", 'debug')
+          swap("            if (!primaryPages.length) throw new Error('No sourcebook pages found. Open the book main Contents page.');", "            if (!primaryPages.length) throw new Error(`No sourcebook pages found. Detected source roots: ${bookRoots.join(', ')}. Open the book main Contents page and reload.`);", 'empty error')
 
           path.write_text(s, encoding='utf-8')
           Path('.github/workflows/apply-v08.yml').unlink()
           PY
-
-      - name: Validate userscript syntax
-        run: node --check ddb-offline-sourcebook-builder.user.js
+          node --check ddb-offline-sourcebook-builder.user.js
 
       - name: Commit v0.8
         run: |
